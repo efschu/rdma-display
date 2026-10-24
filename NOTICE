@@ -26,3 +26,8 @@ gamescope:
   xorgproto, and - where the system's are too old - wayland, libdrm, wayland-protocols,
   libxkbcommon and pixman from their upstream repositories at build time; they keep their own
   licenses. Nothing of them is part of this repository.
+
+Logo:
+
+  assets/logo-*.svg set the wordmark in Inter (Rasmus Andersson, SIL Open Font License 1.1) as outlines;
+  the logo itself is MIT like the rest of the repository.

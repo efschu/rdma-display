@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo-light.svg" alt="rdma-display" width="520">
+  </picture>
+</p>
+
 # rdma-display
 
 Stream a Linux computer's picture, sound and input to another Linux computer over an RDMA
@@ -358,6 +365,7 @@ On a test pair (host with an RTX 2080 Ti behind the chipset, small client PC), 1
 | `seat/` | multiseat: `rdx-seatmgr`, the GPU binding hook |
 | `desktop/`, `tools/` | install script, tray app, udev/polkit rules, systemd units, Proxmox seat tools, measuring tools, launcher starters |
 | `p0a/`, `tests/` | feasibility gates, tests (`make test`) |
+| `assets/` | logo and icon (SVG, light and dark), `make_logo.py` that builds them (fontTools, Inter) |
 | `third_party/` | vendored civetweb, cJSON, stb, afmf-linux, xclip's selection library |
 
 ## License
