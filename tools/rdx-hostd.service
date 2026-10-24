@@ -1,0 +1,22 @@
+# rdma-display host daemon (web UI :47990, control channel :47989 on the link IP).
+# Installed by desktop/install.sh host; started and stopped by the "RDMA Display Host"
+# tray app (polkit rule 50-rdma-display.rules); install.sh also enables it, so it is up after a reboot.
+[Unit]
+Description=rdma-display host daemon (rdx-hostd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# the link address is "link_ip" in /etc/rdx/hostd.json (default 10.0.0.2); --bind IP here would override it
+ExecStart=/opt/rdma-display/host/rdx_hostd --repo /opt/rdma-display --config /etc/rdx/hostd.json
+Restart=on-failure
+RestartSec=2
+# children (mirror source, gamescope source, input, audio, USB) are supervised by the daemon
+KillMode=mixed
+TimeoutStopSec=10
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+# rdma-display: input devices for ONE gamescope only, never this computer's desktop
+# (common/rdx_input.h RDX_INPUT_PRIVATE_*):
+#  - rdx_input_rx --private, rdx_usb_host --private: the client's keyboard, mouse and HID devices
+#    while it plays a gamescope app (rdx-hostd passes --private; a mirrored desktop gets ordinary
+#    devices), phys "rdx:private...";
+#  - the keyboard and mouse of a local window (rdx_gs_src, gs/rdx_localinput.c), phys "rdx:private";
+#  - while a gamescope session forwards USB/IP devices (flag file /run/rdx-vhci-private, made by
+#    rdx_usb_host --private): every input device behind vhci_hcd.
+# They go to the seat "seat-rdx". Xorg, Mutter, KWin and wlroots read seat0 only, so the desktop
+# never sees them, and logind's seat ACL (uaccess, 73-seat-late.rules) is left out; the group
+# rdx-input reads them instead (rdx-hostd makes the app user a member). gamescope's rdx backend
+# reads seat0 and seat-rdx.
+# Order: after 70-uaccess / 71-seat, before 73-seat-late (like loginctl attach's 72-seat-* rules).
+# Installed by desktop/install.sh host into /etc/udev/rules.d.
+ACTION=="remove", GOTO="rdx_input_end"
+SUBSYSTEM!="input", GOTO="rdx_input_end"
+ATTRS{phys}=="rdx:private*", GOTO="rdx_input_private"
+KERNELS=="vhci_hcd.*", TEST=="/run/rdx-vhci-private", GOTO="rdx_input_private"
+GOTO="rdx_input_end"
+
+LABEL="rdx_input_private"
+ENV{ID_SEAT}="seat-rdx", TAG-="uaccess", GROUP="rdx-input", MODE="0660"
+
+LABEL="rdx_input_end"

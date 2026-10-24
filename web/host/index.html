@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RDMA Display Host</title>
+<link rel="icon" href="/api/icon?name=rdx-screen">
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --fg:#1b1f24; --mut:#5c6670; --line:#dde1e6; --acc:#2563eb; --acc-fg:#fff; --ok:#15803d; --bad:#b91c1c; --warn:#b45309; --hover:#eef2f8; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#0f1216; --card:#171b21; --fg:#e6e9ee; --mut:#9aa4af; --line:#2a313a; --acc:#60a5fa; --acc-fg:#0b1220; --ok:#4ade80; --bad:#f87171; --warn:#fbbf24; --hover:#1e242c; } }
+:root[data-theme="dark"] { --bg:#0f1216; --card:#171b21; --fg:#e6e9ee; --mut:#9aa4af; --line:#2a313a; --acc:#60a5fa; --acc-fg:#0b1220; --ok:#4ade80; --bad:#f87171; --warn:#fbbf24; --hover:#1e242c; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, sans-serif; }
+header { padding:16px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+header img { width:28px; height:28px; }
+header h1 { font-size:20px; margin:0; }
+header .mut { font-size:14px; }
+main { max-width:900px; margin:0 auto; padding:16px; display:grid; gap:16px; }
+section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; min-width:0; }
+h2 { font-size:17px; margin:0 0 12px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.mut { color:var(--mut); }
+button { font:inherit; border:1px solid var(--line); background:var(--bg); color:var(--fg); border-radius:8px; padding:8px 14px; cursor:pointer; }
+button.primary { background:var(--acc); border-color:var(--acc); color:var(--acc-fg); }
+button.big { font-size:17px; padding:12px 22px; }
+button.danger { background:var(--bad); border-color:var(--bad); color:#fff; }
+button.link { border:0; background:none; color:var(--acc); padding:4px 0; }
+button:disabled { opacity:.45; cursor:default; }
+.tiles { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:12px; }
+.tile { position:relative; border:1px solid var(--line); border-radius:12px; padding:14px 10px 12px; text-align:center; background:var(--bg); min-width:0; }
+.tile img { width:64px; height:64px; object-fit:contain; display:block; margin:0 auto 8px; }
+.tile .name { font-weight:600; overflow-wrap:anywhere; }
+.tile button.small { margin-top:8px; font-size:12px; padding:4px 8px; }
+.tile .detail { font-size:13px; color:var(--mut); }
+.tile .remove { position:absolute; top:4px; right:6px; border:0; background:none; color:var(--mut); font-size:20px; padding:2px 6px; line-height:1; }
+.tile .remove:hover { color:var(--bad); }
+.list { display:grid; gap:8px; }
+.prog { display:flex; align-items:center; gap:12px; padding:8px 10px; border:1px solid var(--line); border-radius:10px; min-width:0; }
+.prog img { width:40px; height:40px; object-fit:contain; flex:none; }
+.prog .txt { flex:1; min-width:0; }
+.prog .txt div:first-child { font-weight:600; overflow-wrap:anywhere; }
+.prog .txt div:last-child { font-size:13px; color:var(--mut); }
+.prog.rec { border-color:var(--acc); }
+.state { display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+.dot { width:12px; height:12px; border-radius:50%; background:var(--mut); flex:none; }
+.dot.on { background:var(--ok); } .dot.mid { background:var(--warn); }
+.hint { border-left:3px solid var(--warn); padding:6px 10px; margin:10px 0; font-size:14px; }
+details { border-top:1px solid var(--line); margin-top:4px; }
+details > summary { cursor:pointer; padding:10px 0; color:var(--mut); }
+label.field { display:flex; justify-content:space-between; gap:12px; align-items:center; padding:6px 0; flex-wrap:wrap; }
+select, input[type=text], textarea { font:inherit; font-size:14px; color:var(--fg); background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:5px 8px; min-width:0; width:100%; }
+label.field select { width:auto; }
+textarea { font-family:ui-monospace, monospace; min-height:60px; }
+pre { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:8px; max-height:300px; overflow:auto; font-size:12px; white-space:pre-wrap; word-break:break-all; margin:8px 0 0; }
+table { width:100%; border-collapse:collapse; font-size:14px; }
+td, th { text-align:left; padding:4px 6px; border-bottom:1px solid var(--line); white-space:nowrap; }
+.scroll { overflow-x:auto; }
+.row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+#err { color:var(--bad); font-size:14px; }
+/* network link: banner, state rows, module temperature bar */
+.banner { border-radius:10px; padding:10px 14px; margin:0 0 12px; font-weight:600; border:1px solid var(--warn); color:var(--fg);
+          background:color-mix(in srgb, var(--warn) 14%, var(--card)); }
+.banner.alarm, .banner.down, .banner.failed { border-color:var(--bad); background:color-mix(in srgb, var(--bad) 14%, var(--card)); }
+.lvl { font-size:13px; font-weight:600; padding:1px 10px; border-radius:999px; border:1px solid var(--line); color:var(--mut); }
+.lvl.ok { color:var(--ok); border-color:var(--ok); } .lvl.warn { color:var(--warn); border-color:var(--warn); }
+.lvl.alarm, .lvl.down, .lvl.failed { color:var(--bad); border-color:var(--bad); }
+.lvl.failed { background:color-mix(in srgb, var(--bad) 14%, var(--card)); }
+.kv { display:grid; grid-template-columns:max-content 1fr; gap:6px 16px; font-size:15px; margin:0; }
+.kv dt { color:var(--mut); } .kv dd { margin:0; min-width:0; overflow-wrap:anywhere; }
+.kv small { color:var(--mut); display:block; font-size:13px; }
+.tbar { position:relative; height:10px; border-radius:5px; background:var(--line); margin:6px 0 4px; max-width:360px; }
+.tbar .fill { position:absolute; left:0; top:0; bottom:0; border-radius:5px; background:var(--ok); }
+.tbar .fill.warn { background:var(--warn); } .tbar .fill.alarm { background:var(--bad); }
+.tbar .mark { position:absolute; top:-3px; bottom:-3px; width:2px; background:var(--fg); opacity:.55; }
+.tval { font-weight:600; } .tval.warn { color:var(--warn); } .tval.alarm { color:var(--bad); }
+@media (max-width:520px) { .kv { grid-template-columns:1fr; gap:0; } .kv dd { margin-bottom:8px; } }
+.hidden { display:none !important; }
+</style>
+</head>
+<body>
+<header>
+  <img src="/api/icon?name=rdx-screen" alt="">
+  <h1>RDMA Display Host</h1>
+  <span class="mut" id="hostinfo">connecting…</span>
+  <span id="err"></span>
+</header>
+<main>
+  <!-- what runs right now -->
+  <section>
+    <div class="state">
+      <span class="dot" id="sdot"></span>
+      <div style="flex:1; min-width:0">
+        <div id="stitle" style="font-weight:600; font-size:17px">Nothing is streaming</div>
+        <div class="mut" id="ssub">Start an app from the client computer (RDMA Display Client).</div>
+      </div>
+      <button class="big hidden" id="here">Back to this PC</button>
+      <button class="big hidden" id="toclient">Send to the client</button>
+      <button class="danger big hidden" id="stop">Stop</button>
+    </div>
+    <!-- apps running in the background (no client): one row each, Quit really ends it -->
+    <div id="bglist"></div>
+  </section>
+
+  <!-- network link to the client: state, module temperature, last link down (hidden by an old daemon) -->
+  <section id="linksec" class="hidden">
+    <div id="linkbanner" class="banner hidden" role="alert"></div>
+    <h2>Network link <span class="lvl" id="linklvl"></span></h2>
+    <dl class="kv" id="linkbody"></dl>
+  </section>
+
+  <!-- the apps a client can start -->
+  <section>
+    <h2>Apps on this computer <span class="mut" style="font-weight:400; font-size:14px">— the client shows these to start</span></h2>
+    <div class="tiles" id="tiles"></div>
+    <div class="row" style="margin-top:14px">
+      <button class="primary" id="addbtn">+ Add app</button>
+    </div>
+    <div id="addpanel" class="hidden" style="margin-top:14px">
+      <div id="steamhint" class="hint hidden"></div>
+      <div class="row" style="margin-bottom:8px">
+        <input type="text" id="filter" placeholder="Search all programs…" style="max-width:320px">
+        <button class="link" id="closeadd">Close</button>
+      </div>
+      <div class="list" id="programs"><span class="mut">Looking for programs…</span></div>
+      <pre id="steamlog" class="hidden"></pre>
+    </div>
+  </section>
+
+  <!-- everything technical -->
+  <section>
+    <details id="adv">
+      <summary>Advanced settings</summary>
+      <h2 style="margin-top:6px">This seat</h2>
+      <p class="mut" id="seatinfo" style="margin:0 0 8px; font-size:14px"></p>
+      <label class="field">Graphics card that renders the apps
+        <select id="s_gpu"></select></label>
+      <label class="field">Second card for frame generation
+        <select id="s_helper"></select></label>
+      <label class="field">Priority when several seats share the GPU
+        <select id="s_prio"><option value="high">high</option><option value="normal">normal</option><option value="low">low</option></select></label>
+      <label class="field">Picture
+        <select id="s_pic"><option value="monitor+stream">Monitor + stream</option><option value="monitor">Monitor only</option><option value="stream">Stream only</option></select></label>
+      <label class="field">Monitor
+        <select id="s_conn"></select></label>
+      <label class="field">App on the monitor
+        <select id="s_home"></select></label>
+      <p class="mut" id="localinfo" style="margin:0 0 8px; font-size:14px"></p>
+      <div class="row"><button id="saveseat">Save</button><span class="mut" id="seatsaved"></span></div>
+      <div id="seatdevbox" class="hidden">
+        <h3 style="margin:14px 0 4px; font-size:15px">Devices of this seat</h3>
+        <p class="mut" style="margin:0 0 6px; font-size:13px">Keyboards, mice, gamepads and sound outputs at this computer that go to this seat.
+          <a id="seatdevlink" href="#" target="_blank" rel="noopener">Change the assignment</a></p>
+        <ul id="seatdevs" style="margin:0 0 6px; padding-left:18px; font-size:14px"></ul>
+        <div class="row"><button id="seatclaim">Assign a device by key press</button><span class="mut" id="seatclaimst"></span></div>
+      </div>
+
+      <h2 style="margin-top:18px">Defaults for every session</h2>
+      <label class="field">Frame rate limit
+        <select id="d_fps"><option value="0">none (as fast as possible)</option><option>60</option><option>120</option><option>144</option><option>240</option></select></label>
+      <label class="field">Show the mouse pointer (whole-screen apps)
+        <select id="d_cursor"><option value="true">yes</option><option value="false">no</option></select></label>
+      <label class="field">Send sound
+        <select id="d_audio"><option value="true">yes</option><option value="false">no</option></select></label>
+      <label class="field">Take the client's microphone (as "RDMA Display Mic", the default input while streaming; the client's microphone opens only while an app here records)
+        <select id="d_mic"><option value="true">yes</option><option value="false">no</option></select></label>
+      <label class="field">Share the clipboard with the client (text copied in an app here can be pasted on the client's desktop, and the other way round)
+        <select id="d_clip"><option value="true">yes</option><option value="false">no</option></select></label>
+      <label class="field">GPU priority of the screen capture
+        <select id="d_gpu"><option>high</option><option>medium</option><option>low</option></select></label>
+      <label class="field">Variable refresh (FreeSync / VRR): when the client's screen has it, apps send each frame as soon as it is ready
+        <select id="d_vrr"><option value="true">yes</option><option value="false">no</option></select></label>
+      <label class="field">Several apps in the background (switching to another app keeps the previous one running, up to 4 apps; Quit ends one)
+        <select id="d_multi"><option value="true">yes</option><option value="false">no</option></select></label>
+      <div class="row"><button id="savedef">Save</button><span class="mut" id="saved"></span></div>
+
+      <h2 style="margin-top:18px">App details</h2>
+      <p class="mut" style="margin:0 0 8px; font-size:14px">Command line, environment and gamescope options of the added apps.</p>
+      <div id="appedit"></div>
+
+      <h2 style="margin-top:18px">Screens and connection</h2>
+      <div class="scroll"><table id="outs"></table></div>
+      <p class="mut" id="conninfo" style="font-size:14px"></p>
+
+      <h2 style="margin-top:18px">Session details</h2>
+      <div class="scroll"><table id="procs"></table></div>
+      <div class="row" style="margin-top:8px"><select id="logproc" style="width:auto"></select><button id="showlog">Show log</button></div>
+      <pre id="log" class="hidden"></pre>
+    </details>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let showAll = false;
+let state = null, detect = null, editing = false, defDirty = false, seatDirty = false, appsKey = '';
+
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({headers: {'Content-Type': 'application/json'}}, opts || {}));
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function err(e) { $('err').textContent = e ? e.message || String(e) : ''; }
+
+function appName(id) {
+  const a = (state.apps || []).find(x => x.id === id);
+  return a ? a.name : id;
+}
+
+function renderSession() {
+  const s = state.session || {};
+  const st = s.state || 'idle';
+  $('sdot').className = 'dot' + (st === 'running' ? ' on' : st === 'idle' ? '' : ' mid');
+  const susp = state.suspended;
+  /* every app in the background (an older daemon: its one "suspended") */
+  const bg = Array.isArray(state.suspended_apps) ? state.suspended_apps : susp ? [susp] : [];
+  const game = st !== 'idle' && s.params && s.params.app && !String(s.params.app).startsWith('mirror:');
+  /* running game: Stop only disconnects (the game keeps running, the client resumes it);
+   * a suspended game: Quit really ends it */
+  $('stop').classList.toggle('hidden', st === 'idle' && (!susp || bg.length > 1));   /* several: a Quit per row */
+  $('stop').textContent = st !== 'idle' ? (game ? 'Disconnect' : 'Stop') : 'Quit app';
+  $('stop').title = st !== 'idle' && game ? 'Ends the stream; the app keeps running and the client can resume it' : '';
+  /* "Start here on this PC" apps: a window on this desktop; it moves to the client and back */
+  const localWin = st !== 'idle' && s.local_window;
+  $('toclient').classList.toggle('hidden', !localWin);
+  $('here').classList.toggle('hidden', !((st !== 'idle' && game && !localWin) || (st === 'idle' && susp)));
+  if (st === 'idle' && susp) {
+    $('sdot').className = 'dot mid';
+    $('stitle').textContent = bg.length > 1 ? `${bg.length} apps paused` : 'Paused: ' + appName(susp.app);
+    $('ssub').textContent = bg.length > 1 ? 'they keep running without a client · starting one on the client resumes it' :
+      `keeps running without a client (${susp.mode ? susp.mode.w + '×' + susp.mode.h + ', ' + susp.mode.hz + ' Hz' : ''}) · ` +
+      `for ${Math.floor(susp.since_s / 60)} min ${susp.since_s % 60} s · starting it on the client resumes it`;
+  } else if (st === 'idle') {
+    $('stitle').textContent = 'Nothing is streaming';
+    const last = s.last && s.last.reason ? ' Last session: ' + s.last.reason + '.' : '';
+    $('ssub').textContent = 'Start an app from the client computer (RDMA Display Client).' + last;
+  } else {
+    const p = s.params || {};
+    const mode = p.client_mode ? ` at ${p.client_mode.w}×${p.client_mode.h}, ${p.client_mode.hz} Hz` : '';
+    /* variable refresh: what rdx_gs_src really runs (its "[gs] vrr:" line), else what the host decided */
+    const v = s.vrr || {};
+    const vrr = v.active ? ` · variable refresh up to ${Math.round(v.cap_hz * 1000) / 1000} Hz` +
+      (v.source && v.source.startsWith('off') ? ' (the app: ' + v.source + ')' : '') : '';
+    $('stitle').textContent = (st === 'running' ? (localWin ? 'Running here: ' : 'Streaming ') : st === 'starting' ? 'Starting ' : 'Stopping ') + appName(s.app);
+    $('ssub').textContent = (localWin ? `in a window on this desktop${mode}` : `to ${s.client}${mode}`) + vrr + (p.run_as ? `, running as ${p.run_as}` : '') +
+      (s.since_s != null ? ` · for ${Math.floor(s.since_s / 60)} min ${s.since_s % 60} s` : '');
+  }
+  /* the background apps, one row each (several, or one next to a running stream) */
+  const rows = bg.length > 1 || st !== 'idle' ? bg : [];
+  $('bglist').innerHTML = rows.map(a => `<div class="state" style="margin-top:10px"><span class="dot mid"></span>` +
+    `<div style="flex:1; min-width:0"><div style="font-weight:600">Paused: ${esc(appName(a.app))}</div>` +
+    `<div class="mut">${a.mode ? esc(a.mode.w + '×' + a.mode.h + ', ' + a.mode.hz + ' Hz') + ' · ' : ''}for ${Math.floor(a.since_s / 60)} min ${a.since_s % 60} s` +
+    `${a.vram_mib != null ? ' · ' + esc(a.vram_mib) + ' MiB graphics memory' : ''}</div></div>` +
+    `<button class="danger" data-quit="${esc(a.app)}">Quit app</button></div>`).join('');
+  $('bglist').querySelectorAll('button[data-quit]').forEach(b => b.onclick = async () => {
+    try { await api('/api/apps/quit', {method: 'POST', body: JSON.stringify({app: b.dataset.quit})}); refresh(); } catch (e) { err(e); }
+  });
+  const procs = st === 'idle' ? (s.last && s.last.procs) || [] : s.procs || [];
+  $('procs').innerHTML = '<tr><th>part</th><th>running</th><th>CPU</th><th>time</th></tr>' +
+    procs.map(p => `<tr><td>${esc(p.name)}</td><td>${p.running ? 'yes' : 'exit ' + esc(p.exit)}</td><td>${esc(p.cpu_pct)} %</td><td>${esc(p.uptime_s)} s</td></tr>`).join('');
+  const sel = $('logproc'), cur = sel.value;
+  sel.innerHTML = procs.map(p => `<option>${esc(p.name)}</option>`).join('');
+  if (cur) sel.value = cur;
+}
+
+/* ---- network link (state.link from rdx-hostd): same look for ok / warn / alarm / down / failed ---- */
+function fmtSecs(n) {
+  n = Math.round(n);
+  if (n < 60) return n + ' s';
+  if (n < 3600) return Math.floor(n / 60) + ' min' + (n % 60 ? ' ' + (n % 60) + ' s' : '');
+  return Math.floor(n / 3600) + ' h ' + Math.floor(n % 3600 / 60) + ' min';
+}
+function fmtClock(unix) {
+  const d = new Date(unix * 1000), old = Date.now() - d.getTime() > 12 * 3600 * 1000;
+  return old ? d.toLocaleString() : d.toLocaleTimeString();
+}
+const LEVEL_WORD = {ok: 'OK', warn: 'Warning', alarm: 'Alarm', down: 'Link down', failed: 'Card failed', unknown: 'Unknown'};
+function tempClass(m) {
+  if (m.alarm_c != null && m.temp_c >= m.alarm_c) return 'alarm';
+  if (m.warn_c != null && m.temp_c >= m.warn_c) return 'warn';
+  return 'ok';
+}
+function moduleHtml(m) {
+  if (!m) return '<span class="mut">nothing known about the module</span>';
+  if (typeof m.temp_c !== 'number') {       /* e.g. a DAC cable: it has a name but no sensor */
+    const nm = [m.vendor, m.part].filter(Boolean).join(' ');
+    return `<span class="mut">${nm ? esc(nm) + ' – ' : ''}no temperature sensor${nm ? '' : ' (cable without one)'}</span>`;
+  }
+  const hi = (m.alarm_c != null ? m.alarm_c : (m.warn_c != null ? m.warn_c + 8 : m.temp_c + 10)) + 4, lo = 20;
+  const pos = t => Math.max(0, Math.min(100, (t - lo) / (hi - lo) * 100));
+  const cls = tempClass(m);
+  const marks = [m.warn_c, m.alarm_c].filter(x => x != null).map(x => `<i class="mark" style="left:${pos(x)}%"></i>`).join('');
+  const lim = [m.warn_c != null ? `warning at ${m.warn_c} °C` : '', m.alarm_c != null ? `link goes down at ${m.alarm_c} °C` : ''].filter(Boolean).join(' · ');
+  return `<span class="tval ${cls}">${esc(m.temp_c.toFixed(1))} °C</span> <span class="mut">${esc(lim)}</span>
+    <div class="tbar" title="${esc(m.label || 'Module')}"><div class="fill ${cls}" style="width:${pos(m.temp_c)}%"></div>${marks}</div>
+    <small>${esc([m.vendor, m.part].filter(Boolean).join(' '))}${m.highest_c != null ? ` · highest seen ${esc(m.highest_c)} °C` : ''}</small>`;
+}
+/* the card's chip: temperature against the limit the firmware warns at (a ConnectX-4 has no sensor, only kernel log reports) */
+function chipHtml(c) {
+  if (!c) return '<span class="mut">no chip sensor (the driver offers none)</span>';
+  const ev = c.event && c.event_text ? `<small>${esc(c.event_text)}</small>` : '';
+  if (typeof c.temp_c !== 'number') return `<span class="tval alarm">too hot</span>${ev}`;
+  const lim = c.limit_c != null ? c.limit_c : null;
+  const cls = c.event || (lim != null && c.temp_c >= lim) ? 'alarm' : lim != null && c.temp_c >= lim - 10 ? 'warn' : 'ok';
+  const hi = lim != null ? lim + 5 : c.temp_c + 10, lo = 20;
+  const pos = t => Math.max(0, Math.min(100, (t - lo) / (hi - lo) * 100));
+  const marks = lim != null ? [lim - 10, lim].map(x => `<i class="mark" style="left:${pos(x)}%"></i>`).join('') : '';
+  return `<span class="tval ${cls}">${esc(c.temp_c.toFixed(1))} °C</span> <span class="mut">${lim != null ? `limit ${esc(lim)} °C` + (c.highest_c != null ? ` · highest seen ${esc(c.highest_c)} °C` : '') : ''}</span>
+    <div class="tbar" title="${esc(c.label || 'Chip')}"><div class="fill ${cls}" style="width:${pos(c.temp_c)}%"></div>${marks}</div>${ev}`;
+}
+/* the card itself is gone: what was seen and what to do */
+function cardHtml(n) {
+  const cyc = n.power_cycle !== false;
+  return `<span class="tval alarm">${cyc ? 'Failed' : 'Not available'}</span> · ${n.likely_overheated ? 'likely overheated · ' : ''}${esc(n.why || '')}` +
+    `<small>${cyc ? 'Power-cycle the computer: a reconnect cannot bring the card back.' : 'Reload the driver or power-cycle the computer.'}</small>` +
+    (n.detail ? `<small>${esc(n.detail)}</small>` : '');
+}
+function lastDownHtml(L) {
+  const d = L.last_down;
+  if (!d) return L.downs ? `${esc(L.downs)} link down${L.downs > 1 ? 's' : ''} since the program started` : '<span class="mut">none since the program started</span>';
+  const dur = d.back_at ? `down for ${fmtSecs(d.down_s != null ? d.down_s : d.back_at - d.at)}` : 'still down';
+  return `${esc(fmtClock(d.at))} – ${esc(d.reason || 'link down')}${d.temp_c != null ? ` (${esc(d.temp_c.toFixed ? d.temp_c.toFixed(1) : d.temp_c)} °C)` : ''}, ${dur}` +
+    (L.downs > 1 ? `<small>${esc(L.downs)} link downs since the program started</small>` : '') +
+    (d.detail ? `<small>${esc(d.detail)}</small>` : '');
+}
+function renderLink() {
+  const L = state.link;
+  const sec = $('linksec');
+  if (!L || typeof L !== 'object' || (L.known === false && !L.message)) { sec.classList.add('hidden'); return; }
+  sec.classList.remove('hidden');
+  const lvl = L.known === false ? 'unknown' : L.level || 'unknown';
+  $('linklvl').className = 'lvl ' + lvl;
+  $('linklvl').textContent = LEVEL_WORD[lvl] || lvl;
+  const bad = lvl === 'warn' || lvl === 'alarm' || lvl === 'down' || lvl === 'failed';
+  $('linkbanner').className = 'banner ' + lvl + (bad && L.message ? '' : ' hidden');
+  $('linkbanner').textContent = bad ? L.message || '' : '';
+  if (L.known === false) { $('linkbody').innerHTML = `<dt>Link</dt><dd class="mut">${esc(L.message)}</dd>`; return; }
+  const rows = [
+    ['Link', `<span class="tval ${L.up ? '' : 'alarm'}">${L.up ? 'Up' : 'Down'}</span> · ${esc([L.state, L.rate].filter(Boolean).join(' · '))}` +
+      `<small>${esc([L.rdma_dev && L.rdma_dev + (L.port != null ? ' port ' + L.port : ''), L.netdev, L.link_ip].filter(Boolean).join(' · '))}</small>`],
+    ...(L.nic && L.nic.failed ? [['Network card', cardHtml(L.nic)]] : []),
+    ['Module', moduleHtml(L.module)],
+    ['Card chip', chipHtml(L.chip)],
+    ['Last link down', lastDownHtml(L)],
+  ];
+  $('linkbody').innerHTML = rows.map(r => `<dt>${r[0]}</dt><dd>${r[1]}</dd>`).join('');
+}
+
+function renderTiles() {
+  const apps = state.apps || [];
+  $('tiles').innerHTML = apps.map(a => `
+    <div class="tile" title="${esc(a.note || a.detail || '')}">
+      ${a.kind !== 'mirror' ? `<button class="remove" data-rm="${esc(a.id)}" title="Remove">×</button>` : ''}
+      <img src="${esc(a.icon || '/api/icon?name=rdx-screen')}" alt="" loading="lazy">
+      <div class="name">${esc(a.name)}</div>
+      <div class="detail">${esc(a.kind === 'mirror' ? a.detail : (a.note || 'Program'))}</div>
+      ${a.kind !== 'mirror' ? `<button class="small" data-here="${esc(a.id)}" title="Runs in a window on this computer's desktop; it can go to the client later and come back">Start here on this PC</button>` : ''}
+    </div>`).join('') || '<span class="mut">No screens found.</span>';
+  document.querySelectorAll('[data-here]').forEach(b => b.onclick = async () => {
+    try { await api('/api/local', {method: 'POST', body: JSON.stringify({action: 'here', app: b.dataset.here})}); err(); refresh(); }
+    catch (e) { err(e); }
+  });
+  document.querySelectorAll('[data-rm]').forEach(b => b.onclick = async () => {
+    if (!confirm('Remove ' + appName(b.dataset.rm) + ' from the list?')) return;
+    try { await api('/api/apps/remove', {method: 'POST', body: JSON.stringify({id: b.dataset.rm})}); err(); refresh(); if (detect) loadPrograms(); }
+    catch (e) { err(e); }
+  });
+}
+
+function renderPrograms() {
+  if (!detect) return;
+  const f = $('filter').value.trim().toLowerCase();
+  /* games and game launchers first; everything else only on request or by search */
+  const all = detect.programs.filter(p => !f || p.name.toLowerCase().includes(f));
+  const progs = f || showAll ? all : all.filter(p => p.game);
+  const hint = $('steamhint');
+  if (!detect.steam_installed) {
+    hint.classList.remove('hidden');
+    hint.innerHTML = 'Steam is not installed on this computer. <button class="primary" id="installsteam">Install Steam</button>';
+    $('installsteam').onclick = installSteam;
+  } else hint.classList.add('hidden');
+  $('programs').innerHTML = progs.map((p, i) => `
+    <div class="prog${p.recommended ? ' rec' : ''}">
+      <img src="${esc(p.icon_url)}" alt="" loading="lazy">
+      <div class="txt"><div>${esc(p.name)}</div><div>${p.recommended ? 'Recommended: games you start in it run in the stream too' : p.game ? 'Game' : 'Program'}</div></div>
+      ${p.added ? '<span class="mut">added</span>' : `<button class="primary" data-add="${i}">Add</button>`}
+    </div>`).join('') + (!f && !showAll && all.length > progs.length ?
+      `<button class="link" id="showall">Show all programs (${all.length})</button>` : '') ||
+      '<span class="mut">No programs found.</span>';
+  if ($('showall')) $('showall').onclick = () => { showAll = true; renderPrograms(); };
+  document.querySelectorAll('[data-add]').forEach(b => b.onclick = async () => {
+    const p = progs[+b.dataset.add];
+    b.disabled = true;
+    try { await api('/api/apps/add', {method: 'POST', body: JSON.stringify({desktop_id: p.id})}); err(); await refresh(); await loadPrograms(); }
+    catch (e) { err(e); b.disabled = false; }
+  });
+}
+
+async function loadPrograms() {
+  try { detect = await api('/api/apps/detect'); renderPrograms(); } catch (e) { err(e); }
+}
+
+async function installSteam() {
+  $('installsteam').disabled = true;
+  $('steamlog').classList.remove('hidden');
+  try {
+    let s = await api('/api/steam', {method: 'POST', body: '{}'});
+    while (s.installing) {
+      $('steamhint').firstChild.textContent = 'Installing Steam… (this takes a few minutes) ';
+      $('steamlog').textContent = (s.log || '').split('\n').slice(-12).join('\n');
+      await new Promise(r => setTimeout(r, 1500));
+      s = await api('/api/steam');
+    }
+    $('steamlog').textContent = (s.log || '').split('\n').slice(-12).join('\n');
+    if (!s.installed) throw new Error('Steam installation failed (exit ' + s.exit + '), see the log');
+    await loadPrograms();
+  } catch (e) { err(e); }
+}
+
+function renderAdvanced() {
+  const d = (state.config || {}).defaults || {};
+  if (!defDirty) {
+    $('d_fps').value = String(d.fps || 0);
+    $('d_cursor').value = String(d.cursor !== false);
+    $('d_audio').value = String(d.audio !== false);
+    $('d_mic').value = String(d.mic !== false);
+    $('d_clip').value = String(d.clipboard !== false);
+    $('d_gpu').value = d.gpu_prio || 'high';
+    $('d_vrr').value = String(d.vrr !== false);
+    $('d_multi').value = String(d.suspend_multi !== false);
+  }
+  const c = state.config || {};
+  if (!seatDirty) {
+    $('s_prio').value = c.priority || 'normal';
+    const gpus = (state.gpus || []).filter(g => g.usable);
+    const opts = first => `<option value="">${first}</option>` +
+      gpus.map(g => `<option value="${esc(g.pci)}">${esc(g.name)} (${esc(g.pci)})</option>`).join('');
+    const sig = JSON.stringify(gpus) + (c.gpu || '') + '|' + (c.helper_gpu || '');
+    if ($('s_gpu').dataset.sig !== sig) {      /* rebuild only on change: no flicker while open */
+      $('s_gpu').innerHTML = opts('automatic (first card)');
+      $('s_helper').innerHTML = opts('none');
+      $('s_gpu').value = c.gpu || '';
+      $('s_helper').value = c.helper_gpu || '';
+      $('s_gpu').dataset.sig = sig;
+    }
+    /* the seat's own monitor: connectors with the monitor's name from its EDID */
+    const loc = state.local || {}, conns = loc.connectors || [];
+    const homes = (c.apps || []).filter(a => (a.kind || 'gamescope') === 'gamescope');
+    const lsig = JSON.stringify(conns.map(x => [x.name, x.monitor, x.connected])) + JSON.stringify(homes.map(a => a.id)) +
+      (c.picture || '') + '|' + (c.monitor_connector || '') + '|' + (c.home_app || '');
+    if ($('s_conn').dataset.sig !== lsig) {
+      $('s_pic').value = c.picture || 'monitor+stream';
+      $('s_conn').innerHTML = '<option value="">automatic (the connected one)</option>' + conns.map(x =>
+        `<option value="${esc(x.name)}">${esc(x.name)}${x.connected ? ' · ' + esc(x.monitor || 'monitor') +
+         (x.mode ? ' ' + esc(x.mode) : '') : ' · nothing connected'}</option>`).join('');
+      $('s_conn').value = c.monitor_connector || '';
+      $('s_home').innerHTML = homes.map(a => `<option value="${esc(a.id)}">${esc(a.name || a.id)}</option>`).join('');
+      $('s_home').value = c.home_app || 'steam';
+      $('s_conn').dataset.sig = lsig;
+    }
+  }
+  const loc = state.local || {};
+  $('localinfo').textContent = loc.running
+    ? `On the monitor: ${appName(loc.app)} on ${loc.connector}${loc.monitor ? ' (' + loc.monitor + ')' : ''}` +
+      (loc.asleep ? ' · monitor off' : '') + (loc.picture === 'monitor+stream' ? ' · a client starting it joins' : '')
+    : `Nothing on the monitor${loc.why_not ? ': ' + loc.why_not : ''}`;
+  $('seatinfo').textContent = `${state.seat_name || 'Seat ' + (state.seat || 0)} · GPU ${state.gpu || '?'}` +
+    (state.gpu_name ? ` (${state.gpu_name})` : '') + ` · control port ${c.ctl_port}, web port ${c.web_port}` +
+    (c.helper_gpu ? ` · helper GPU ${c.helper_gpu}` : '');
+  seatDevices(c);
+  $('outs').innerHTML = '<tr><th>screen</th><th>size</th><th>refresh</th><th>position</th></tr>' +
+    (state.outputs || []).map(o => `<tr><td>${esc(o.name)}</td><td>${o.w}×${o.h}</td><td>${o.hz} Hz</td><td>+${o.x}+${o.y}</td></tr>`).join('');
+  $('conninfo').textContent = `Link address ${state.link_ip} · clients connected: ${(state.clients || []).join(', ') || 'none'}` +
+    ` · control channel ${state.ctl_listening ? 'listening' : 'not listening'}`;
+  const apps = (state.config || {}).apps || [];
+  const key = JSON.stringify(apps);
+  if (editing || key === appsKey) return;
+  appsKey = key;
+  $('appedit').innerHTML = apps.map((a, i) => `
+    <details style="border:1px solid var(--line); border-radius:8px; padding:0 10px; margin-bottom:8px">
+      <summary>${esc(a.name)} <span class="mut">(${esc(a.id)})</span></summary>
+      <label class="field" style="display:block">Name<input type="text" data-k="name" data-i="${i}" value="${esc(a.name)}"></label>
+      <label class="field" style="display:block">Command (one argument per line)<textarea data-k="cmd" data-i="${i}">${esc((a.cmd || []).join('\n'))}</textarea></label>
+      <label class="field" style="display:block">Environment (KEY=VALUE per line)<textarea data-k="env" data-i="${i}">${esc(Object.entries(a.env || {}).map(([k, v]) => k + '=' + v).join('\n'))}</textarea></label>
+      <label class="field" style="display:block">gamescope options (one per line)<textarea data-k="gamescope_args" data-i="${i}">${esc((a.gamescope_args || []).join('\n'))}</textarea></label>
+      <div class="row" style="padding-bottom:10px"><button data-save="${i}">Save</button></div>
+    </details>`).join('') || '<span class="mut">No apps added yet.</span>';
+  document.querySelectorAll('#appedit textarea, #appedit input').forEach(el => el.oninput = () => { editing = true; });
+  document.querySelectorAll('[data-save]').forEach(b => b.onclick = async () => {
+    const i = +b.dataset.save, list = JSON.parse(JSON.stringify(apps));
+    const val = k => document.querySelector(`[data-k="${k}"][data-i="${i}"]`).value;
+    const lines = k => val(k).split('\n').map(x => x.trim()).filter(Boolean);
+    list[i].name = val('name').trim();
+    list[i].cmd = lines('cmd');
+    list[i].gamescope_args = lines('gamescope_args');
+    list[i].env = Object.fromEntries(lines('env').map(l => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]).filter(([k]) => k));
+    try { await api('/api/apps', {method: 'POST', body: JSON.stringify({apps: list})}); editing = false; appsKey = ''; err(); refresh(); }
+    catch (e) { err(e); }
+  });
+}
+
+/* rdx-seatmgr (one container per seat on the Proxmox host): this seat's local devices, read-only,
+   and "the next key press on an unassigned device is mine" */
+let seatDevBusy = false;
+async function seatDevices(c) {
+  const box = $('seatdevbox');
+  if (!c.seatmgr || !state.seat) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  $('seatdevlink').href = c.seatmgr_ui || '#';
+  $('seatdevlink').classList.toggle('hidden', !c.seatmgr_ui);
+  if (seatDevBusy) return;
+  seatDevBusy = true;
+  try {
+    const r = await fetch(`${c.seatmgr}/api/seat/${state.seat}`, {cache: 'no-store'});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.status);
+    const kinds = {keyboard: 'keyboard', mouse: 'mouse', joystick: 'gamepad', sound: 'sound output'};
+    $('seatdevs').innerHTML = (j.devices || []).map(d => `<li>${esc(d.name || d.id)}` +
+      (d.roles || []).filter(k => kinds[k]).map(k => ` · ${kinds[k]}`).join('') +
+      (d.active ? ' <b>(in use)</b>' : '') + '</li>').join('') || '<li class="mut">none</li>';
+    const s = j.seat || {};
+    $('seatclaim').disabled = s.claim_s != null;
+    $('seatclaimst').textContent = s.claim_s != null ? `Press a key on the device for this seat (${Math.ceil(s.claim_s)} s)` :
+      (s.claimed && Date.now() / 1000 - s.claimed.t < 20 ? `Assigned: ${s.claimed.name || s.claimed.id}` : '');
+  } catch (e) {
+    $('seatdevs').innerHTML = `<li class="mut">seat manager not reachable (${esc(e.message || e)})</li>`;
+  } finally { seatDevBusy = false; }
+}
+$('seatclaim').onclick = async () => {
+  const c = state.config || {};
+  try {
+    const r = await fetch(`${c.seatmgr}/api/claim`, {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({seat: state.seat, seconds: 15})});
+    if (!r.ok) throw new Error((await r.json()).error || r.status);
+    err(); seatDevices(c);
+  } catch (e) { err(e); }
+};
+
+async function refresh() {
+  try {
+    state = await api('/api/state');
+    $('hostinfo').textContent = state.seat_name || state.host_name;
+    err();
+    renderSession(); try { renderLink(); } catch (e) { $('linksec').classList.add('hidden'); } renderTiles(); renderAdvanced();
+  } catch (e) { $('hostinfo').textContent = 'not reachable'; err(e); }
+}
+
+$('stop').onclick = async () => {
+  try {
+    const st = (state.session || {}).state || 'idle';
+    if (st === 'idle' && state.suspended)
+      await api('/api/apps/quit', {method: 'POST', body: JSON.stringify({app: state.suspended.app})});
+    else await api('/api/session/stop', {method: 'POST'});
+    refresh();
+  } catch (e) { err(e); }
+};
+$('here').onclick = async () => {
+  try { await api('/api/local', {method: 'POST', body: JSON.stringify({action: 'here'})}); err(); refresh(); } catch (e) { err(e); }
+};
+$('toclient').onclick = async () => {
+  try { await api('/api/local', {method: 'POST', body: JSON.stringify({action: 'to_client'})}); err(); refresh(); } catch (e) { err(e); }
+};
+$('addbtn').onclick = () => { $('addpanel').classList.remove('hidden'); $('addbtn').classList.add('hidden'); loadPrograms(); };
+$('closeadd').onclick = () => { $('addpanel').classList.add('hidden'); $('addbtn').classList.remove('hidden'); };
+$('filter').oninput = renderPrograms;
+['d_fps', 'd_cursor', 'd_audio', 'd_mic', 'd_clip', 'd_gpu', 'd_vrr'].forEach(id => $(id).onchange = () => { defDirty = true; });
+['s_prio', 's_gpu', 's_helper', 's_pic', 's_conn', 's_home'].forEach(id => $(id).onchange = () => { seatDirty = true; });
+$('saveseat').onclick = async () => {
+  try {
+    await api('/api/config', {method: 'POST', body: JSON.stringify({priority: $('s_prio').value,
+      gpu: $('s_gpu').value, helper_gpu: $('s_helper').value, picture: $('s_pic').value,
+      monitor_connector: $('s_conn').value, home_app: $('s_home').value})});
+    seatDirty = false; $('seatsaved').textContent = 'saved; the picture setting applies within seconds, the cards at the next app start';
+    setTimeout(() => $('seatsaved').textContent = '', 3000);
+  } catch (e) { err(e); }
+};
+$('savedef').onclick = async () => {
+  const defaults = {fps: +$('d_fps').value, cursor: $('d_cursor').value === 'true', audio: $('d_audio').value === 'true', mic: $('d_mic').value === 'true', clipboard: $('d_clip').value === 'true', gpu_prio: $('d_gpu').value, vrr: $('d_vrr').value === 'true', suspend_multi: $('d_multi').value === 'true'};
+  try { await api('/api/config', {method: 'POST', body: JSON.stringify({defaults})}); defDirty = false; $('saved').textContent = 'saved'; setTimeout(() => $('saved').textContent = '', 2000); }
+  catch (e) { err(e); }
+};
+$('showlog').onclick = async () => {
+  const r = await fetch('/api/logs?proc=' + encodeURIComponent($('logproc').value));
+  $('log').classList.remove('hidden');
+  $('log').textContent = await r.text();
+};
+refresh();
+setInterval(refresh, 2000);
+</script>
+<script src="mgpu.js"></script>
+</body>
+</html>

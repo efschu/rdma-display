@@ -1,0 +1,25 @@
+#!/bin/sh
+# Battle.net (Blizzard's launcher) in its own Proton prefix: umu-launcher + GE-Proton.
+# Started by rdx-hostd (app "Battle.net"), from Steam as a non-Steam game, or by hand.
+# Installed to /usr/local/bin/rdx-battlenet by tools/pve-seat-provision.sh update.
+# BNET_PREFIX / BNET_PROTON override the prefix and the Proton build.
+export WINEPREFIX="${BNET_PREFIX:-$HOME/Games/battlenet}"
+export PROTONPATH="${BNET_PROTON:-$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton11-11-x86_64}"
+export GAMEID=umu-battlenet
+# as Lutris' battlenet-standard installer: locationapi off; no Windows menu entries on the desktop
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}locationapi=d;winemenubuilder.exe=d"
+# a Steam launch hands down the Steam runtime's library path; umu brings its own runtime (steamrt4)
+unset LD_LIBRARY_PATH
+cd "$HOME" || exit 1
+exe="$WINEPREFIX/drive_c/Program Files (x86)/Battle.net/Battle.net Launcher.exe"
+[ -f "$exe" ] || { echo "rdx-battlenet: $exe is missing (Battle.net not installed in $WINEPREFIX)" >&2; exit 1; }
+# hardware acceleration on: with it off (Lutris' default) the login page only half paints. Set here at
+# every start because Battle.net restarts itself after a self-update without the arguments below
+# (Faugus #1026), and then this setting is the only fix left
+cfg="$WINEPREFIX/drive_c/users/steamuser/AppData/Roaming/Battle.net/Battle.net.config"
+[ -f "$cfg" ] && sed -i 's/"HardwareAcceleration": *"false"/"HardwareAcceleration": "true"/' "$cfg"
+# --in-process-gpu: CEF (Chrome 108 inside Battle.net.exe) renders in the browser process instead of a
+# separate GPU process. Without it the login page goes white after the first click/keystroke and only
+# the repainted parts (the input field) come back (reproduced in gamescope headless and in rdx).
+# The launcher hands the flag on to Battle.net.exe (seen: "Battle.net.exe --in-process-gpu --from-launcher").
+exec /usr/local/bin/umu-run "$exe" --in-process-gpu "$@"

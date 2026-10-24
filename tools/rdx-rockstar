@@ -1,0 +1,110 @@
+#!/bin/sh
+# Rockstar Games Launcher (RGL, for GTA V and the other Rockstar titles) in its own Proton prefix:
+# umu-launcher + GE-Proton. Same shape as rdx-battlenet.
+# Started by rdx-hostd (app "Rockstar Games Launcher"), from Steam as a non-Steam game, or by hand.
+# Installed to /usr/local/bin/rdx-rockstar by tools/pve-seat-provision.sh update.
+#
+#   rdx-rockstar            start the launcher
+#   rdx-rockstar --install  download Rockstar's installer and run it silently in the prefix
+#                           (software rendering on a private Xvfb, no GPU needed); never logs in
+#
+# RGL_PREFIX / RGL_PROTON override the prefix and the Proton build. RGL_RUNNER=wine runs the plain
+# Wine of the distribution instead of umu + Proton (Proton issue #10125: the sign-in of some RGL builds
+# fails with "Code: 2" under Proton but works in plain Wine, Lutris' way). RGL_INSTALLER is a path or
+# URL of an installer to use instead of Rockstar's current one (Lutris pins an old build for GTA San
+# Andreas because the newest does not always install).
+#
+# Prior art taken over: Lutris installer "grand-theft-auto-v-rockstar-games-launcher" (corefonts, a
+# 64-bit prefix, winedbg.exe disabled, game exe drive_c/Program Files/Rockstar Games/Launcher/Launcher.exe,
+# RockstarService/Launcher/LauncherPatcher left running after the installer), the umu-database entry
+# "Grand Theft Auto V, store none, umu-271590" (GAMEID, so umu-protonfixes applies the GTA V fix:
+# winebus SDL on, hidraw off, no Steam API init), Rockstar's own silent switch "/s /f" (launcher update
+# 1.0.105.2705 notes).
+RUNNER="${RGL_RUNNER:-umu}"
+export WINEPREFIX="${RGL_PREFIX:-$HOME/Games/rockstar}"
+export PROTONPATH="${RGL_PROTON:-$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton11-11-x86_64}"
+# standalone Rockstar installer entry of the umu-database (shared with the Epic version via STORE)
+export GAMEID=umu-271590
+export STORE=none
+# winedbg.exe off as in Lutris' GTA V script (no crash dialog waiting forever in a stream);
+# no Windows menu entries on the desktop
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}winedbg.exe=d;winemenubuilder.exe=d"
+# BattlEye: GTA Online's BattlEye has no Linux switch. Proton loads Valve's "Proton BattlEye Runtime"
+# (a free Steam tool, appid 1161040) when PROTON_BATTLEYE_RUNTIME names it; with the game's BattlEye
+# servers blocked (pve-seat-provision.sh update: /etc/hosts of the seat) invite-only and friend
+# sessions work, public lobbies do not (Arch wiki "Steam/Game-specific troubleshooting", GTA V).
+# The user's own risk with Rockstar's terms. Taken from the Steam library when it is installed there.
+if [ -z "${PROTON_BATTLEYE_RUNTIME:-}" ]; then
+  for d in "$HOME/.steam/debian-installation/steamapps/common/Proton BattlEye Runtime" \
+           "$HOME/.local/share/Steam/steamapps/common/Proton BattlEye Runtime"; do
+    [ -d "$d" ] && { export PROTON_BATTLEYE_RUNTIME="$d"; break; }
+  done
+fi
+# NVIDIA's shader disk cache large and never pruned: GTA V Enhanced (D3D12 through vkd3d-proton)
+# stalls for seconds whenever a pipeline is compiled (seen: 6-14 s without a frame on the
+# first start); the driver's default cache is small and cleaned up, so a later start compiles again
+export __GL_SHADER_DISK_CACHE_SIZE="${__GL_SHADER_DISK_CACHE_SIZE:-10737418240}"
+export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP="${__GL_SHADER_DISK_CACHE_SKIP_CLEANUP:-1}"
+# gamescope's WSI layer (host/install-gamescope.sh, pve-seat-provision.sh update): with it the game
+# presents straight to gamescope. Without it vkd3d-proton presents through Xwayland, and GTA V Enhanced
+# on the 5090 stopped presenting for 2-40 s after every mouse or key input (perf: its
+# vkd3d-swapchain thread spun in the NVIDIA driver). Said in the log when it is missing.
+if [ "${ENABLE_GAMESCOPE_WSI:-}" = 1 ] &&
+   ! ls /usr/share/vulkan/implicit_layer.d/*gamescope*wsi*.json /etc/vulkan/implicit_layer.d/*gamescope*wsi*.json >/dev/null 2>&1; then
+  echo "rdx-rockstar: gamescope's WSI layer is not installed (no manifest in /usr/share/vulkan/implicit_layer.d): games present through Xwayland" >&2
+fi
+# a Steam launch hands down the Steam runtime's library path; umu brings its own runtime (steamrt4)
+unset LD_LIBRARY_PATH
+cd "$HOME" || exit 1
+exe="$WINEPREFIX/drive_c/Program Files/Rockstar Games/Launcher/Launcher.exe"
+URL=https://gamedownloads.rockstargames.com/public/installer/Rockstar-Games-Launcher.exe
+UMU=/usr/local/bin/umu-run
+
+if [ "$1" != "--install" ]; then
+  [ -f "$exe" ] || { echo "rdx-rockstar: $exe is missing (Rockstar Games Launcher not installed in $WINEPREFIX; run rdx-rockstar --install)" >&2; exit 1; }
+  if [ "$RUNNER" = wine ]; then exec wine "$exe" "$@"; fi
+  exec "$UMU" "$exe" "$@"
+fi
+
+# ---- --install
+src="${RGL_INSTALLER:-$URL}"
+dir="$HOME/.cache/rdx-rockstar"
+inst="$dir/Rockstar-Games-Launcher.exe"
+log="$dir/install.log"
+limit="${RGL_INSTALL_TIMEOUT:-900}"
+mkdir -p "$dir" "$WINEPREFIX" || exit 1
+case "$src" in
+  http://*|https://*)
+    curl -fL --retry 3 -o "$inst.part" "$src" && mv "$inst.part" "$inst" || { echo "rdx-rockstar: download of $src failed" >&2; exit 1; } ;;
+  *) cp "$src" "$inst" || exit 1 ;;
+esac
+# software only: a private Xvfb, nothing touches the seat's GPU or display
+unset WAYLAND_DISPLAY
+Xvfb :92 -screen 0 1280x800x24 -nolisten tcp >/tmp/rdx-rockstar-xvfb.log 2>&1 &
+xv=$!
+trap 'kill $xv 2>/dev/null' EXIT
+export DISPLAY=:92
+sleep 2
+# corefonts as in Lutris' scripts (best effort: the launcher draws without them too)
+if [ "$RUNNER" = wine ]; then winetricks -q corefonts >/dev/null 2>&1; else "$UMU" winetricks -q corefonts >/dev/null 2>&1; fi \
+  || echo "rdx-rockstar: winetricks corefonts failed (continuing)" >&2
+# the installer refuses to run while a Launcher.exe is up
+pkill -f 'Rockstar Games.Launcher.Launcher\.exe' 2>/dev/null
+# /s /f = Rockstar's silent mode. The installer can stay alive waiting for the launcher's service after
+# the files are in place (Lutris ignores RockstarService/Launcher/LauncherPatcher for that reason), so it
+# runs under a time limit and success is the presence of Launcher.exe
+if [ "$RUNNER" = wine ]; then
+  timeout "$limit" wine "$inst" /s /f >"$log" 2>&1 &
+else
+  timeout "$limit" "$UMU" "$inst" /s /f >"$log" 2>&1 &
+fi
+ip=$!
+n=0
+while kill -0 "$ip" 2>/dev/null && [ ! -f "$exe" ] && [ "$n" -lt "$limit" ]; do sleep 2; n=$((n + 2)); done
+# a little more time so the installer finishes writing, then end what it left running in the prefix
+[ -f "$exe" ] && sleep 30
+kill "$ip" 2>/dev/null
+pkill -f 'RockstarService\.exe|LauncherPatcher\.exe|Rockstar Games.(Launcher|Social Club).' 2>/dev/null
+if [ -f "$exe" ]; then echo "rdx-rockstar: installed: $exe"; exit 0; fi
+echo "rdx-rockstar: $exe is missing after the installer (log: $log)" >&2
+exit 1

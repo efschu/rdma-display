@@ -1,0 +1,18 @@
+[Unit]
+Description=rdma-display seat manager: input, sound and USB devices to the seat containers
+Documentation=file:///opt/rdx-seatmgr/README
+After=systemd-udevd.service network-online.target pve-guests.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/rdx-seatmgr/rdx_seatmgr.py --config /etc/rdx/seatmgr.json
+Restart=always
+RestartSec=2
+RuntimeDirectory=rdx-seatmgr
+RuntimeDirectoryPreserve=yes
+# small and never in the way of the host's other workloads
+Nice=5
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

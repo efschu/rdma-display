@@ -1,0 +1,2968 @@
+diff --git a/src/Backends/RdxBackend.cpp b/src/Backends/RdxBackend.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/Backends/RdxBackend.cpp
+@@ -0,0 +1,1797 @@
++// rdx backend: composite straight into NIC-readable buffers for rdma-display (the gamescope path).
++//
++// Like the headless backend (no window, no DRM output), but every presented frame lands in
++// one of the output buffers that rdx_gs_src hands over a unix socket (RDX_GS_SOCKET):
++//  - VRAM: CUDA VMM allocations, linear B8G8R8A8, imported as Vulkan images from opaque
++//    fds; the NIC reads the same VRAM (peer reads through BAR1).
++//  - HOST: pinned host memory (memfds), imported with VK_EXT_external_memory_host. As a
++//    linear image if the driver allows that (the composite writes straight over PCIe),
++//    else as a buffer: composite into a VRAM image, then one GPU copy into the buffer. The
++//    NIC reads host RAM and never touches the GPU.
++// rdx_gs_src registers the memory with the RDMA NIC and writes it to the client's scanout
++// buffer.
++//
++// Pacing: rdx_gs_src frees a slot when the client returns its credit, and re-anchors our
++// vblank timer on the client's vblank grid (minus network time), so we composite just in
++// time for the client's next vblank.
++//
++// Variable refresh (RDX_GS_FLAG_VRR: the client's screen has FreeSync / VRR and shows every frame on
++// arrival): the connector reports VRR, so steamcompmgr runs gamescope's own adaptive sync path
++// (FlipType::VRR: paint as soon as the app presents, its frame limiter and flip-ready test, frame
++// callbacks at the app's pace) instead of painting on our vblank timer, and rdx_gs_src sends no
++// VBLANK. refresh_mhz is the cap (the client's maximum; the app sees it as the refresh rate). We
++// play the part of the DRM page flip: a frame "flips" when it is composited, but never sooner than
++// one cap period after the previous flip (rdx_gs_src holds the post until then, like the kernel holds
++// an early VRR flip), and that time is marked as the vblank, which is what the flip-ready test reads.
++// Below the client's minimum the client repeats frames itself. RDX_GS_VRR=0 turns it off (debugging).
++// The client's screen may switch it during the session (RDX_GS_VRR message: same buffers, new refresh).
++//
++// Resume at another client mode: rdx_gs_src sends RECONFIG (a new hello + new buffer fds).
++// The paint thread drops the old slots, imports the new ones, ACKs, and sets the new output
++// size/refresh; steamcompmgr sees g_nOutputWidth/Height change (like an SDL window resize)
++// and re-lays out. The app keeps running at its own size and is scaled to the new output.
++// READY carries the slot generation, so a late READY for an old slot is never posted.
++//
++// Stream add-on (another backend, e.g. DRM on the seat GPU's own monitor port): with
++// RDX_GS_STREAM_SOCKET set, a second instance of this class (stream mode, never the backend)
++// connects to rdx_gs_src on that path whenever one listens there (retry every 500 ms), imports
++// its slots in the paint thread and, after every frame the monitor got, composites the same
++// layers once more at the client's size into a free slot (blit shader, SDR gamma 2.2 like
++// gamescope's PipeWire stream), copies it to host RAM and sends READY. rdx_gs_src ending
++// (client gone) drops the slots; the monitor keeps running. The clock: the side of the last
++// input leads (RdxNoteInput from wlserver: devices named "rdx: ..." are rdx_input_rx's mirrors
++// of the client's devices). Monitor side: the DRM page flips drive gamescope's vblank, the
++// stream gets each frame as it comes. Client side: the client's VBLANK messages drive it, the
++// monitor follows (a frame whose flip would collide with one still in flight skips the monitor).
++//
++// Pointer hint: the connector has INestedHints like gamescope's nested backends (SDL, Wayland),
++// and steamcompmgr calls SetRelativeMouseMode( cursor hidden && pointer constrained && not Steam )
++// on it. Every change goes to rdx_gs_src as RDX_GS_HINT; it tells the client whether to send
++// relative motion (a game that locks the pointer) or absolute positions (a desktop app).
++// The stream add-on (a DRM backend, no hints) gets the same hint from RdxStreamSetRelativeMouse,
++// which steamcompmgr calls with the same rule while a stream is attached.
++//
++// The cursor next to the picture (RDX_GS_CURSOR 1 from rdx_gs_src: its client shows the cursor itself,
++// rdma-display common/rdx_cursor.h): like a nested backend, ShouldPaintCursor() is false, so steamcompmgr
++// draws no cursor into the frames and a pointer that only moves repaints nothing (wlserver_oncursorevent);
++// it hands the X cursor's picture to SetCursorImage instead (CURIMG to rdx_gs_src, in chunks), and
++// RdxCursorMoved / RdxCursorTick send where the hotspot is in output pixels (CURPOS): the focused surface's
++// position mapped like touch input in reverse (focusedWindowScale/Offset, the mapping the absolute pointer of
++// the client uses), visible = an image that is not hidden (gamescope's own hide after inactivity runs as in
++// the composited case). RDX_GS_CURSOR 0 (the start, a client without the channel) draws it again. Not in
++// stream mode: the stream add-on's frames are the monitor's and keep their cursor.
++
++#include "backend.h"
++#include "rendervulkan.hpp"
++#include "wlserver.hpp"
++#include "refresh_rate.h"
++#include "steamcompmgr.hpp"
++#include "vblankmanager.hpp"
++#include "LibInputHandler.h"
++#include "main.hpp"
++
++#include "rdx_gs_proto.h"
++#include "RdxStream.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <vector>
++#include <condition_variable>
++#include <mutex>
++#include <csignal>
++#include <poll.h>
++#include <climits>
++#include <linux/input.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <thread>
++#include <unistd.h>
++
++extern int g_nPreferredOutputWidth;
++extern int g_nPreferredOutputHeight;
++
++static LogScope rdx_log( "rdx" );
++
++// steamcompmgr.cpp: gamescope's adaptive sync setting (--adaptive-sync, GAMESCOPE_VRR_ENABLED)
++extern gamescope::ConVar<bool> cv_adaptive_sync;
++
++namespace gamescope
++{
++	class CRdxBackend;
++	// the rdx backend itself (not a stream add-on): the cursor hooks of steamcompmgr and wlserver reach it here
++	static CRdxBackend *s_pRdxBackend = nullptr;
++
++	// The pointer hint towards one rdx_gs_src: remembers what it was told last and sends only a change
++	// (one HINT packet, under a mutex so the recorded state and the packets stay in order).
++	class CRdxHintSender
++	{
++	public:
++		// pszWho: for the log. A failed send is not recorded, so the next call sends it again.
++		void Set( CRdxBackend *pBackend, bool bRelative, const char *pszWho );
++		// the peer is gone or new: it starts absolute
++		void Reset()
++		{
++			std::lock_guard<std::mutex> lock( m_Mutex );
++			m_bRelative = false;
++			m_bLogged = false;
++		}
++
++	private:
++		std::mutex m_Mutex;
++		bool m_bRelative = false;        // what rdx_gs_src was told last (it starts absolute)
++		bool m_bLogged = false;
++	};
++
++	// What steamcompmgr tells a nested backend's host window, and what it means here: only the
++	// relative mouse mode is of use (the client's pointer), the rest is the host window's business.
++	// Every caller of GetNestedHints() must behave as with nullptr, see ShouldPaintCursor and
++	// SetSelection (steamcompmgr.cpp: cursor texture, hotspot, selection).
++	class CRdxHints final : public INestedHints
++	{
++	public:
++		CRdxHints( CRdxBackend *pBackend ) : m_pBackend( pBackend ) {}
++
++		virtual void SetCursorImage( std::shared_ptr<CursorInfo> info ) override;
++		virtual void SetRelativeMouseMode( bool bRelative ) override;
++		virtual void SetVisible( bool bVisible ) override {}
++		virtual void SetTitle( std::shared_ptr<std::string> szTitle ) override {}
++		virtual void SetIcon( std::shared_ptr<std::vector<uint32_t>> uIconPixels ) override {}
++		virtual void SetSelection( std::shared_ptr<std::string> szContents, GamescopeSelection eSelection ) override
++		{
++			// no host window to hand it to: what a backend without hints does with it
++			gamescope_set_selection( *szContents, eSelection );
++		}
++		// the cursor is part of the frame, unless the client shows it itself (RDX_GS_CURSOR)
++		virtual bool ShouldPaintCursor() override;
++
++	private:
++		CRdxBackend *m_pBackend;
++		CRdxHintSender m_Sender;
++	};
++
++	class CRdxConnector final : public CBaseBackendConnector
++	{
++	public:
++		CRdxConnector( CRdxBackend *pBackend ) : m_pBackend( pBackend ), m_Hints( pBackend ) {}
++		virtual ~CRdxConnector() {}
++
++		virtual GamescopeScreenType GetScreenType() const override { return GAMESCOPE_SCREEN_TYPE_INTERNAL; }
++		virtual GamescopePanelOrientation GetCurrentOrientation() const override { return GAMESCOPE_PANEL_ORIENTATION_0; }
++		virtual bool SupportsHDR() const override { return false; }
++		virtual bool IsHDRActive() const override { return false; }
++		virtual const BackendConnectorHDRInfo &GetHDRInfo() const override { return m_HDRInfo; }
++		virtual bool IsVRRActive() const override;
++		virtual std::span<const BackendMode> GetModes() const override { return std::span<const BackendMode>{}; }
++		virtual bool SupportsVRR() const override;
++		virtual std::span<const uint8_t> GetRawEDID() const override { return std::span<const uint8_t>{}; }
++		virtual std::span<const uint32_t> GetValidDynamicRefreshRates() const override { return std::span<const uint32_t>{}; }
++
++		virtual void GetNativeColorimetry(
++			bool bHDR10,
++			displaycolorimetry_t *displayColorimetry, EOTF *displayEOTF,
++			displaycolorimetry_t *outputEncodingColorimetry, EOTF *outputEncodingEOTF ) const override
++		{
++			*displayColorimetry = displaycolorimetry_709;
++			*displayEOTF = EOTF_Gamma22;
++			*outputEncodingColorimetry = displaycolorimetry_709;
++			*outputEncodingEOTF = EOTF_Gamma22;
++		}
++
++		virtual const char *GetName() const override { return "rdx"; }
++		virtual const char *GetMake() const override { return "rdma-display"; }
++		virtual const char *GetModel() const override { return "Remote Display"; }
++
++		virtual int Present( const FrameInfo_t *pFrameInfo, bool bAsync ) override;
++
++		virtual INestedHints *GetNestedHints() override { return &m_Hints; }
++
++	private:
++		CRdxBackend *m_pBackend;
++		CRdxHints m_Hints;
++		BackendConnectorHDRInfo m_HDRInfo{};
++	};
++
++	class CRdxBackend final : public CBaseBackend
++	{
++	public:
++		explicit CRdxBackend( bool bStream = false ) : m_Connector( this ), m_bStream( bStream ) {}
++
++		virtual ~CRdxBackend()
++		{
++			m_bRunning = false;
++			if ( m_nSocket >= 0 )
++				shutdown( m_nSocket, SHUT_RDWR );
++			m_StreamCv.notify_all();
++			if ( m_RecvThread.joinable() )
++				m_RecvThread.join();
++			if ( m_StreamThread.joinable() )
++				m_StreamThread.join();
++			if ( m_nInputStop[ 1 ] >= 0 && write( m_nInputStop[ 1 ], "x", 1 ) != 1 )
++				rdx_log.errorf_errno( "stopping the input thread" );
++			if ( m_InputThread.joinable() )
++				m_InputThread.join();
++			for ( uint32_t i = 0; i < RDX_GS_MAX_SLOTS; i++ )
++				if ( m_pHostMap[ i ] )
++					munmap( m_pHostMap[ i ], m_Hello.slot_size );
++		}
++
++		virtual bool Init() override
++		{
++			const char *pszPath = getenv( "RDX_GS_SOCKET" );
++			if ( !pszPath )
++			{
++				fprintf( stderr, "rdx backend: RDX_GS_SOCKET is not set (start gamescope through rdx_gs_src)\n" );
++				return false;
++			}
++			if ( !Connect( pszPath, false ) )
++				return false;
++			s_pRdxBackend = this;
++
++			g_nOutputWidth = m_Hello.width;
++			g_nOutputHeight = m_Hello.height;
++			// the client's exact refresh: our vblank timer runs on its grid (variable refresh: the cap)
++			g_nOutputRefresh = m_Hello.refresh_mhz;
++			g_nNestedRefresh = m_Hello.refresh_mhz;
++			UpdateVrr();
++			if ( g_nPreferredOutputWidth && ( (uint32_t)g_nPreferredOutputWidth != m_Hello.width ||
++			                                   (uint32_t)g_nPreferredOutputHeight != m_Hello.height ) )
++				rdx_log.infof( "-W/-H %dx%d ignored, the client mode is %ux%u", g_nPreferredOutputWidth,
++				               g_nPreferredOutputHeight, m_Hello.width, m_Hello.height );
++
++			if ( !vulkan_init( vulkan_get_instance(), VK_NULL_HANDLE ) )
++				return false;
++
++			if ( !ImportSlots() )
++				return false;
++
++			if ( !wlsession_init() )
++			{
++				fprintf( stderr, "Failed to initialize Wayland session\n" );
++				return false;
++			}
++
++			m_RecvThread = std::thread( [this]() { RecvThread(); } );
++
++			// input: like headless there is no window to take it from. Read the seat's devices
++			// with gamescope's own libinput handler, but only virtual devices (rdx_input_rx's mirrors
++			// of the client's keyboard/mouse, a local window's, Steam Input, uhid) and USB/IP.
++			{
++				extern bool g_bRdxOnlyRdxDevices;
++				const char *pszInput = getenv( "RDX_GS_INPUT" );
++				g_bRdxOnlyRdxDevices = !( pszInput && !strcmp( pszInput, "all" ) );
++				rdx_log.infof( "input: %s", g_bRdxOnlyRdxDevices ? "virtual devices and USB/IP only, not this host's own keyboard/mouse"
++				                                                  : "every device of the seat (RDX_GS_INPUT=all)" );
++			}
++			// and the seat "seat-rdx": the client's devices of a gamescope session and a local window's
++			// are for this gamescope only, no desktop reads that seat (rdma-display
++			// common/rdx_input.h RDX_INPUT_PRIVATE_*, desktop/72-rdma-display-input.rules)
++			m_pLibInput = std::make_unique<CLibInputHandler>();
++			m_pLibInputPrivate = std::make_unique<CLibInputHandler>();
++			const bool bSeat0 = m_pLibInput->Init( "seat0" );
++			const bool bPrivate = m_pLibInputPrivate->Init( "seat-rdx" );
++			if ( !bSeat0 )
++				m_pLibInput = nullptr;
++			if ( !bPrivate )
++				m_pLibInputPrivate = nullptr;
++			if ( ( bSeat0 || bPrivate ) && pipe2( m_nInputStop, O_CLOEXEC ) == 0 &&
++			     pipe2( m_nInputWake, O_CLOEXEC | O_NONBLOCK ) == 0 )
++				m_InputThread = std::thread( [this]() { InputThread(); } );
++			else
++				rdx_log.errorf( "no libinput on seat0 or seat-rdx: input from the client will not reach the app" );
++			return true;
++		}
++
++		virtual bool PostInit() override { return true; }
++
++		virtual std::span<const char *const> GetInstanceExtensions() const override { return std::span<const char *const>{}; }
++		virtual std::span<const char *const> GetDeviceExtensions( VkPhysicalDevice pVkPhysicalDevice ) const override
++		{
++			// VRAM buffers need the opaque fd import, host buffers VK_EXT_external_memory_host, host
++			// buffers handed over as dma-bufs (RDX_GS_FLAG_DMABUF) VK_EXT_external_memory_dma_buf
++			static const char *const s_Exts[] = { VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME };
++			static const char *const s_DmabufExts[] = { VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME };
++			if ( m_Hello.buf_kind == RDX_GS_BUF_HOST && ( m_Hello.flags & RDX_GS_FLAG_DMABUF ) )
++				return std::span<const char *const>{ s_DmabufExts, 2u };
++			return std::span<const char *const>{ s_Exts, m_Hello.buf_kind == RDX_GS_BUF_HOST ? 2u : 1u };
++		}
++		virtual VkImageLayout GetPresentLayout() const override { return VK_IMAGE_LAYOUT_GENERAL; }
++		virtual void GetPreferredOutputFormat( uint32_t *pPrimaryPlaneFormat, uint32_t *pOverlayPlaneFormat ) const override
++		{
++			*pPrimaryPlaneFormat = VulkanFormatToDRM( VK_FORMAT_B8G8R8A8_UNORM );
++			*pOverlayPlaneFormat = VulkanFormatToDRM( VK_FORMAT_B8G8R8A8_UNORM );
++		}
++		virtual bool ValidPhysicalDevice( VkPhysicalDevice pVkPhysicalDevice ) const override
++		{
++			// composite on the GPU rdx_gs_src chose (VRAM buffers live there)
++			VkPhysicalDeviceIDProperties idProps = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
++			VkPhysicalDeviceProperties2 props = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &idProps };
++			g_device.vk.GetPhysicalDeviceProperties2( pVkPhysicalDevice, &props );
++			if ( memcmp( idProps.deviceUUID, m_Hello.gpu_uuid, VK_UUID_SIZE ) != 0 )
++			{
++				rdx_log.errorf( "Vulkan picked %s, but rdx_gs_src chose another GPU "
++				                "(it passes --prefer-vk-device for it)", props.properties.deviceName );
++				return false;
++			}
++			rdx_log.infof( "compositing on %s (%s buffers)", props.properties.deviceName,
++			               m_Hello.buf_kind == RDX_GS_BUF_HOST ? "host" : "VRAM" );
++			return true;
++		}
++
++		virtual void DirtyState( bool bForce, bool bForceModeset ) override {}
++		virtual bool PollState() override { return false; }
++
++		virtual std::shared_ptr<BackendBlob> CreateBackendBlob( const std::type_info &type, std::span<const uint8_t> data ) override
++		{
++			return std::make_shared<BackendBlob>( data );
++		}
++
++		virtual OwningRc<IBackendFb> ImportDmabufToBackend( wlr_dmabuf_attributes *pDmaBuf ) override
++		{
++			return new CBaseBackendFb();
++		}
++
++		virtual bool UsesModifiers() const override { return false; }
++		virtual std::span<const uint64_t> GetSupportedModifiers( uint32_t uDrmFormat ) const override { return std::span<const uint64_t>{}; }
++
++		virtual IBackendConnector *GetCurrentConnector() override { return &m_Connector; }
++		virtual IBackendConnector *GetConnector( GamescopeScreenType eScreenType ) override
++		{
++			return eScreenType == GAMESCOPE_SCREEN_TYPE_INTERNAL ? &m_Connector : nullptr;
++		}
++
++		virtual bool SupportsPlaneHardwareCursor() const override { return false; }
++		// tearing mode (rdx_sink_kms --tearing): the client shows frames on arrival, so let
++		// gamescope present as soon as the app does (with --immediate-flips)
++		virtual bool SupportsTearing() const override { return ( m_Hello.flags & RDX_GS_FLAG_TEARING ) != 0; }
++		virtual bool UsesVulkanSwapchain() const override { return false; }
++		virtual bool IsSessionBased() const override { return false; }
++		virtual bool SupportsExplicitSync() const override { return true; }
++		virtual bool IsPaused() const override { return false; }
++		virtual bool IsVisible() const override { return true; }
++		virtual glm::uvec2 CursorSurfaceSize( glm::uvec2 uvecSize ) const override { return uvecSize; }
++		virtual bool HackTemporarySetDynamicRefresh( int nRefresh ) override { return false; }
++		virtual void HackUpdatePatchedEdid() override {}
++
++		// one composite into a free slot; called by the connector's Present
++		int PresentToSlot( const FrameInfo_t *pFrameInfo )
++		{
++			const uint64_t ulEntry = get_time_in_nanos();
++			if ( m_bVrrChange.exchange( false ) )
++				ApplyVrrChange();
++			if ( m_bReconfig.load() )
++			{
++				// this frame was laid out for the old size: drop it, the next one uses the new mode
++				ApplyReconfig();
++				return -EAGAIN;
++			}
++			int nSlot = TakeFreeSlot();
++			if ( nSlot < 0 )
++			{
++				// the client still holds every slot: skip this frame, the next vblank tries again
++				m_ulNoSlot++;
++				return -EAGAIN;
++			}
++
++			// No direct scan-out in this backend: a client's buffer is never handed on as the
++			// frame, every frame is composited into one of our slots (the only memory the NIC
++			// has registered). Log what the layers are whenever their shape changes, and refuse a
++			// layer that would sample one of our own slots.
++			const int nLayers = pFrameInfo->layers.count();
++			uint64_t ulShape = (uint64_t)nLayers;
++			for ( int l = 0; l < nLayers; l++ )
++			{
++				const auto &layer = pFrameInfo->layers.get( l );
++				for ( uint32_t k = 0; k < m_Hello.nslots; k++ )
++					if ( layer.tex != nullptr && layer.tex.get() == m_pSlotTex[ k ].get() )
++					{
++						rdx_log.errorf( "layer %d samples output slot %u: frame dropped", l, k );
++						GiveSlot( nSlot );
++						return -EINVAL;
++					}
++				if ( layer.tex )
++					ulShape = ulShape * 1000003u + ( (uint64_t)layer.tex->width() << 32 | layer.tex->height() ) + layer.tex->format();
++			}
++			if ( ulShape != m_ulLastShape && m_nShapeLogs < 64 )
++			{
++				m_ulLastShape = ulShape;
++				m_nShapeLogs++;
++				char szLayers[ 512 ] = {};
++				size_t o = 0;
++				for ( int l = 0; l < nLayers && o < sizeof( szLayers ) - 48; l++ )
++				{
++					const auto &layer = pFrameInfo->layers.get( l );
++					o += snprintf( szLayers + o, sizeof( szLayers ) - o, " [%d: %ux%u fmt %d z %d]", l,
++					               layer.tex ? layer.tex->width() : 0, layer.tex ? layer.tex->height() : 0,
++					               layer.tex ? (int)layer.tex->format() : -1, (int)layer.zpos );
++				}
++				rdx_log.infof( "frame %llu -> slot %d: %d layers%s", (unsigned long long)m_ulFrames, nSlot, nLayers, szLayers );
++			}
++
++			// vblank-paced: from the vblank wake-up; tearing and variable refresh: from the moment gamescope presents
++			const bool bVrr = m_bVrr.load();
++			const uint64_t ulBegin = ( ( m_Hello.flags & RDX_GS_FLAG_TEARING ) || bVrr ) ? ulEntry : g_SteamCompMgrVBlankTime.ulWakeupTime;
++			std::optional<uint64_t> oSeq = vulkan_composite( (FrameInfo_t *)pFrameInfo, nullptr, false, m_pSlotTex[ nSlot ], false );
++			if ( oSeq && m_HostBuffer[ nSlot ] != VK_NULL_HANDLE )
++			{
++				// host buffer without image import: one GPU copy of the composite into host RAM.
++				// Same queue, so the barrier in it orders the copy after the composite.
++				oSeq = CopyToHost( nSlot );
++			}
++			if ( !oSeq )
++			{
++				GiveSlot( nSlot );
++				return -EIO;
++			}
++			// the NIC reads this memory next, so the frame must be complete in it before READY:
++			// the timeline wait covers the composite (and the copy). Host buffers: the GPU's
++			// writes to system memory are snooped (cache coherent on x86), the HOST_READ barrier
++			// makes them available, and both the CPU and the NIC then see the whole frame.
++			vulkan_wait( *oSeq, true );
++			const uint64_t ulDone = get_time_in_nanos();
++			GetVBlankTimer().UpdateLastDrawTime( ulDone - ulBegin );
++
++			rdx_gs_msg msg = {
++				.magic = RDX_GS_MAGIC, .type = RDX_GS_READY, .slot = (uint32_t)nSlot, .pad = m_uGen,
++				.seq = m_ulFrames++, .t_ns = ulDone, .t_begin_ns = ulBegin,
++			};
++			if ( send( m_nSocket, &msg, sizeof( msg ), MSG_NOSIGNAL ) != (ssize_t)sizeof( msg ) )
++				rdx_log.errorf_errno( "READY to rdx_gs_src failed" );
++			if ( bVrr )
++				MarkVrrFlip( ulDone );
++			return 0;
++		}
++
++		// HINT to rdx_gs_src (any thread: one send() of one packet on the SEQPACKET socket, like READY
++		// and ACK, never blocks the compositor). false: not sent, the caller retries.
++		bool SendHint( uint32_t uBits )
++		{
++			if ( m_nSocket < 0 )
++				return false;
++			rdx_gs_msg msg = { .magic = RDX_GS_MAGIC, .type = RDX_GS_HINT, .slot = uBits, .pad = 0 };
++			return send( m_nSocket, &msg, sizeof( msg ), MSG_NOSIGNAL | MSG_DONTWAIT ) == (ssize_t)sizeof( msg );
++		}
++
++		// variable refresh (RDX_GS_FLAG_VRR), for the connector: any thread
++		bool VrrActive() const { return m_bVrr.load(); }
++
++		// the client shows the cursor itself (RDX_GS_CURSOR 1); never with --force-relative-mouse, which
++		// composites the cursor whatever the backend says (ShouldDrawCursor)
++		bool CursorSeparate() const { return m_bCursorSep.load() && !g_bForceRelativeMouse; }
++
++		// steamcompmgr (getTexture, nested path): the X cursor's picture changed, nullptr = none (empty)
++		void CursorImage( std::shared_ptr<INestedHints::CursorInfo> info )
++		{
++			std::lock_guard<std::mutex> lock( m_CursorMutex );
++			m_pCursorInfo = std::move( info );
++			m_uCursorSerial++;
++			m_bCursorImagePending = m_pCursorInfo != nullptr;
++			m_uCursorImageOff = 0;
++			SendCursorImageLocked();
++		}
++
++		// wlserver lock held (the input thread on every motion, the main loop in RdxCursorTick): where the
++		// hotspot is in output pixels and whether the cursor shows; a CURPOS when that changed
++		void CursorPosition( bool bForce )
++		{
++			if ( m_nSocket < 0 || !CursorSeparate() )
++				return;
++			double flX = 0.0, flY = 0.0;
++			bool bVisible = false;
++			wlserver_cursor_state( &flX, &flY, &bVisible );
++			// surface = ( output + offset ) * scale (touch, the absolute pointer): output = surface / scale - offset
++			const float flScaleX = focusedWindowScaleX > 0.0f ? focusedWindowScaleX : 1.0f;
++			const float flScaleY = focusedWindowScaleY > 0.0f ? focusedWindowScaleY : 1.0f;
++			const int32_t nX = (int32_t)lround( flX / flScaleX - focusedWindowOffsetX );
++			const int32_t nY = (int32_t)lround( flY / flScaleY - focusedWindowOffsetY );
++			std::lock_guard<std::mutex> lock( m_CursorMutex );
++			bVisible = bVisible && m_pCursorInfo != nullptr;
++			if ( !bForce && m_bCursorSent && nX == m_nCursorX && nY == m_nCursorY && bVisible == m_bCursorVisible &&
++			     m_uCursorSentSerial == m_uCursorSerial )
++				return;
++			rdx_gs_msg msg = {
++				.magic = RDX_GS_MAGIC, .type = RDX_GS_CURPOS, .slot = bVisible ? RDX_GS_CUR_VISIBLE : 0u,
++				.pad = m_uCursorSerial, .seq = (uint64_t)(uint32_t)nX | (uint64_t)(uint32_t)nY << 32,
++				.t_ns = get_time_in_nanos(), .t_begin_ns = 0,
++			};
++			if ( send( m_nSocket, &msg, sizeof( msg ), MSG_NOSIGNAL | MSG_DONTWAIT ) != (ssize_t)sizeof( msg ) )
++				return;                  // not recorded: the next motion or tick sends it
++			m_bCursorSent = true;
++			m_nCursorX = nX;
++			m_nCursorY = nY;
++			m_bCursorVisible = bVisible;
++			m_uCursorSentSerial = m_uCursorSerial;
++		}
++
++		// main loop, every pass: a picture that did not fit into the socket yet, and the position after a
++		// relayout or a visibility change that came without a motion
++		void CursorTick()
++		{
++			if ( !CursorSeparate() )
++				return;
++			{
++				std::lock_guard<std::mutex> lock( m_CursorMutex );
++				SendCursorImageLocked();
++			}
++			wlserver_lock();
++			CursorPosition( false );
++			wlserver_unlock( false );
++		}
++
++		// main loop: RDX_GS_CURSOR 1 came, steamcompmgr reads the X cursor again (setDirty), so the whole
++		// state goes to the new client
++		bool CursorTakeResync() { return m_bCursorResync.exchange( false ); }
++
++	protected:
++		virtual void OnBackendBlobDestroyed( BackendBlob *pBlob ) override {}
++
++	private:
++		// the hello's RDX_GS_FLAG_VRR -> m_bVrr (Init, RECONFIG; never in stream mode, where the monitor's
++		// DRM backend owns adaptive sync). gamescope's adaptive_sync convar follows, so GAMESCOPE_VRR_ENABLED
++		// and the frame's allowVRR say the same; a later GAMESCOPE_VRR_ENABLED=0 (Steam's per-game setting)
++		// does not switch it off: the client's screen and its setting decide (logged once, PresentToSlot).
++		void UpdateVrr()
++		{
++			const char *pszEnv = getenv( "RDX_GS_VRR" );
++			const bool bOff = pszEnv && !strcmp( pszEnv, "0" );
++			const bool bWant = ( m_Hello.flags & RDX_GS_FLAG_VRR ) && !( m_Hello.flags & RDX_GS_FLAG_TEARING );
++			const bool bVrr = bWant && !bOff;
++			const bool bWas = m_bVrr.exchange( bVrr );
++			m_ulLastFlip = 0;
++			m_bVrrAppOffLogged = false;
++			if ( bVrr )
++				cv_adaptive_sync = true;
++			else if ( bWas )
++				cv_adaptive_sync = false;
++			if ( bVrr )
++				rdx_log.infof( "variable refresh: on, frames as the app presents them, at most %.3f Hz (no vblank pacing)",
++				               m_Hello.refresh_mhz / 1000.0 );
++			else if ( bWant )
++				rdx_log.infof( "variable refresh: off (RDX_GS_VRR=0), fixed %.3f Hz on our vblank timer", m_Hello.refresh_mhz / 1000.0 );
++			else if ( bWas )
++				rdx_log.infof( "variable refresh: off, the client's vblank paces us again (%.3f Hz)", m_Hello.refresh_mhz / 1000.0 );
++		}
++
++		// paint thread: RDX_GS_VRR from rdx_gs_src (the client's screen changed variable refresh during the
++		// session, or a resume at the same mode): the new refresh (the cap, or the sink's fixed refresh) and
++		// adaptive sync, like ApplyReconfig without new buffers
++		void ApplyVrrChange()
++		{
++			std::lock_guard<std::mutex> lock( m_ReconfigMutex );
++			const uint32_t uOld = m_Hello.refresh_mhz;
++			if ( m_uPendingVrrMhz.load() >= 1000 )
++				m_Hello.refresh_mhz = m_uPendingVrrMhz.load();
++			m_Hello.flags = m_bPendingVrrOn.load() ? ( m_Hello.flags | RDX_GS_FLAG_VRR ) : ( m_Hello.flags & ~RDX_GS_FLAG_VRR );
++			g_nOutputRefresh = m_Hello.refresh_mhz;
++			g_nNestedRefresh = m_Hello.refresh_mhz;
++			rdx_log.infof( "RDX_GS_VRR: %.3f Hz -> %.3f Hz", uOld / 1000.0, m_Hello.refresh_mhz / 1000.0 );
++			UpdateVrr();
++			force_repaint();
++		}
++
++		// paint thread, variable refresh: the frame composited at ulDone flips now, or one cap period after
++		// the previous flip if it came sooner (rdx_gs_src holds the post until then, the same rule as
++		// rdx_gs_vrr_hold_until: within 2 % of the period it goes now). That moment is our vblank, like the
++		// DRM backend's page flip event: steamcompmgr's flip-ready test and frame limiter measure from it.
++		void MarkVrrFlip( uint64_t ulDone )
++		{
++			const uint64_t ulPeriod = gamescope::mHzToRefreshCycle( (int32_t)m_Hello.refresh_mhz );
++			uint64_t ulFlip = ulDone;
++			if ( m_ulLastFlip && ulDone + ulPeriod / 50 < m_ulLastFlip + ulPeriod )
++				ulFlip = m_ulLastFlip + ulPeriod;
++			m_ulLastFlip = ulFlip;
++			GetVBlankTimer().MarkVBlank( ulFlip, true );
++			if ( !cv_adaptive_sync && !m_bVrrAppOffLogged )
++			{
++				m_bVrrAppOffLogged = true;
++				rdx_log.infof( "GAMESCOPE_VRR_ENABLED=0 (Steam's per-game setting?) ignored: the client's screen runs "
++				               "variable refresh and its setting decides (RDX_GS_VRR=0 turns it off here)" );
++			}
++		}
++
++		// connect to rdx_gs_src and take its hello + buffer fds; bQuiet: a stream polling for a
++		// listener (no error lines while nobody listens)
++		bool Connect( const char *pszPath, bool bQuiet )
++		{
++			m_nSocket = socket( AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0 );
++			sockaddr_un addr = { .sun_family = AF_UNIX };
++			snprintf( addr.sun_path, sizeof( addr.sun_path ), "%s", pszPath );
++			if ( m_nSocket < 0 || connect( m_nSocket, (sockaddr *)&addr, sizeof( addr ) ) != 0 )
++			{
++				if ( !bQuiet )
++					rdx_log.errorf_errno( "connect %s", pszPath );
++				if ( m_nSocket >= 0 )
++					close( m_nSocket );
++				m_nSocket = -1;
++				return false;
++			}
++
++			iovec iov = { .iov_base = &m_Hello, .iov_len = sizeof( m_Hello ) };
++			alignas( cmsghdr ) char cbuf[ CMSG_SPACE( sizeof( int ) * RDX_GS_MAX_SLOTS ) ];
++			msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = cbuf, .msg_controllen = sizeof( cbuf ) };
++			if ( recvmsg( m_nSocket, &m, MSG_CMSG_CLOEXEC ) != (ssize_t)sizeof( m_Hello ) ||
++			     m_Hello.magic != RDX_GS_MAGIC || m_Hello.type != RDX_GS_HELLO ||
++			     m_Hello.nslots == 0 || m_Hello.nslots > RDX_GS_MAX_SLOTS ||
++			     ( m_Hello.buf_kind != RDX_GS_BUF_VRAM && m_Hello.buf_kind != RDX_GS_BUF_HOST ) )
++			{
++				rdx_log.errorf( "invalid hello from rdx_gs_src (protocol mismatch?)" );
++				return false;
++			}
++			cmsghdr *c = CMSG_FIRSTHDR( &m );
++			if ( !c || c->cmsg_type != SCM_RIGHTS || c->cmsg_len != CMSG_LEN( sizeof( int ) * m_Hello.nslots ) )
++			{
++				rdx_log.errorf( "hello without %u buffer fds", m_Hello.nslots );
++				return false;
++			}
++			memcpy( m_nSlotFds, CMSG_DATA( c ), sizeof( int ) * m_Hello.nslots );
++			rdx_log.infof( "client mode %ux%u @ %.3f Hz, %u %s slots of %llu B, stride %u%s", m_Hello.width, m_Hello.height,
++			               m_Hello.refresh_mhz / 1000.0, m_Hello.nslots, m_Hello.buf_kind == RDX_GS_BUF_HOST ? "host" : "VRAM",
++			               (unsigned long long)m_Hello.slot_size, m_Hello.stride,
++			               ( m_Hello.flags & RDX_GS_FLAG_TEARING ) ? ", tearing (no vblank pacing)"
++			               : ( m_Hello.flags & RDX_GS_FLAG_VRR ) ? ", variable refresh (the refresh is the cap)" : "" );
++			return true;
++		}
++
++		// the picture as CURIMG chunks (m_CursorMutex held); a full socket leaves it pending and RdxCursorTick goes
++		// on from that chunk (a 256x256 picture is 16 chunks of 16 KiB, more than a unix socket holds unread)
++		void SendCursorImageLocked()
++		{
++			if ( !m_bCursorImagePending || m_nSocket < 0 || !CursorSeparate() || !m_pCursorInfo )
++				return;
++			const INestedHints::CursorInfo &info = *m_pCursorInfo;
++			const uint32_t uW = std::min<uint32_t>( info.uWidth, RDX_GS_CUR_MAX );
++			const uint32_t uH = std::min<uint32_t>( info.uHeight, RDX_GS_CUR_MAX );
++			if ( !uW || !uH || info.pPixels.size() < (size_t)info.uWidth * info.uHeight )
++			{
++				m_bCursorImagePending = false;
++				return;
++			}
++			std::vector<uint32_t> vecPixels( (size_t)uW * uH );     // rows of uW: a bigger picture is clipped
++			for ( uint32_t y = 0; y < uH; y++ )
++				memcpy( &vecPixels[ (size_t)y * uW ], &info.pPixels[ (size_t)y * info.uWidth ], uW * 4 );
++			const uint32_t uTotal = uW * uH * 4;
++			std::vector<uint8_t> vecPacket( sizeof( rdx_gs_curimg ) + RDX_GS_CUR_CHUNK );
++			const uint64_t ulNow = get_time_in_nanos();
++			for ( uint32_t uOff = m_uCursorImageOff; uOff < uTotal; uOff += RDX_GS_CUR_CHUNK )
++			{
++				const uint32_t uLen = std::min<uint32_t>( RDX_GS_CUR_CHUNK, uTotal - uOff );
++				rdx_gs_curimg hdr = {
++					.magic = RDX_GS_MAGIC, .type = RDX_GS_CURIMG, .serial = m_uCursorSerial,
++					.w = (uint16_t)uW, .h = (uint16_t)uH,
++					.hot_x = (uint16_t)std::min<uint32_t>( info.uXHotspot, uW - 1 ),
++					.hot_y = (uint16_t)std::min<uint32_t>( info.uYHotspot, uH - 1 ),
++					.off = uOff, .len = uLen, .pad = 0, .t_ns = ulNow,
++				};
++				memcpy( vecPacket.data(), &hdr, sizeof( hdr ) );
++				memcpy( vecPacket.data() + sizeof( hdr ), (const uint8_t *)vecPixels.data() + uOff, uLen );
++				const size_t uSize = sizeof( hdr ) + uLen;
++				if ( send( m_nSocket, vecPacket.data(), uSize, MSG_NOSIGNAL | MSG_DONTWAIT ) != (ssize_t)uSize )
++					return;              // pending: on from this chunk
++				m_uCursorImageOff = uOff + uLen;
++			}
++			m_bCursorImagePending = false;
++			m_uCursorImageOff = 0;
++			if ( !m_bCursorLogged )
++			{
++				m_bCursorLogged = true;
++				rdx_log.infof( "cursor next to the picture: first picture %ux%u (hotspot %u,%u) sent", uW, uH,
++				               info.uXHotspot, info.uYHotspot );
++			}
++		}
++
++		// RDX_GS_CURSOR from rdx_gs_src (receive thread)
++		void SetCursorSeparate( bool bOn )
++		{
++			const bool bWas = m_bCursorSep.exchange( bOn );
++			{
++				std::lock_guard<std::mutex> lock( m_CursorMutex );
++				m_bCursorSent = false;                 // a new client: the whole state again
++				m_bCursorImagePending = m_pCursorInfo != nullptr;
++				m_uCursorImageOff = 0;
++			}
++			if ( bOn )
++				m_bCursorResync = true;
++			if ( bWas != bOn )
++				rdx_log.infof( "cursor: %s", bOn ? "next to the picture, the client shows it (none drawn into the frames)"
++				                                 : "drawn into the frames" );
++			force_repaint();                           // the frame with or without it
++		}
++
++		void SendAck( uint32_t uRowPitch, int nError, uint32_t uPath = 0 )
++		{
++			rdx_gs_ack ack = { .magic = RDX_GS_MAGIC, .type = RDX_GS_ACK, .row_pitch = uRowPitch, .error = nError,
++			                   .path = uPath, .pad = 0 };
++			send( m_nSocket, &ack, sizeof( ack ), MSG_NOSIGNAL );
++		}
++
++		uint32_t FindType( uint32_t uBits, VkMemoryPropertyFlags want )
++		{
++			VkPhysicalDeviceMemoryProperties memProps;
++			g_device.vk.GetPhysicalDeviceMemoryProperties( g_device.physDev(), &memProps );
++			for ( uint32_t t = 0; t < memProps.memoryTypeCount; t++ )
++				if ( ( uBits & ( 1u << t ) ) && ( memProps.memoryTypes[ t ].propertyFlags & want ) == want )
++					return t;
++			return UINT32_MAX;
++		}
++
++		bool ImportSlots()
++		{
++			return m_Hello.buf_kind == RDX_GS_BUF_HOST ? ImportHostSlots() : ImportVramSlots();
++		}
++
++		// one linear B8G8R8A8 image for slot i (memory bound by the caller); mutable, because the
++		// texture wrapper creates a UNORM storage view and an sRGB sampled view
++		bool CreateLinearImage( uint32_t i, const void *pExtInfo, VkMemoryRequirements *pReq )
++		{
++			const VkFormat formats[] = { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB };
++			VkImageFormatListCreateInfo formatList = {
++				.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, .pNext = pExtInfo,
++				.viewFormatCount = 2, .pViewFormats = formats,
++			};
++			VkImageCreateInfo imageInfo = {
++				.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &formatList,
++				.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT,
++				.imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_UNORM,
++				.extent = { m_Hello.width, m_Hello.height, 1 }, .mipLevels = 1, .arrayLayers = 1,
++				.samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
++				.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++				         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++				.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++			};
++			VkResult res = g_device.vk.CreateImage( g_device.device(), &imageInfo, nullptr, &m_Images[ i ] );
++			if ( res != VK_SUCCESS )
++			{
++				rdx_log.errorf( "vkCreateImage (linear, external memory) failed: %d", res );
++				SendAck( 0, -EINVAL );
++				return false;
++			}
++			g_device.vk.GetImageMemoryRequirements( g_device.device(), m_Images[ i ], pReq );
++			if ( pReq->size > m_Hello.slot_size )
++			{
++				rdx_log.errorf( "image needs %llu B, slot has %llu B", (unsigned long long)pReq->size, (unsigned long long)m_Hello.slot_size );
++				SendAck( 0, -ENOSPC );
++				return false;
++			}
++			return true;
++		}
++
++		// bound image -> row pitch check -> output texture
++		bool WrapSlotImage( uint32_t i )
++		{
++			VkImageSubresource sub = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT };
++			VkSubresourceLayout layout;
++			g_device.vk.GetImageSubresourceLayout( g_device.device(), m_Images[ i ], &sub, &layout );
++			if ( layout.offset != 0 || ( m_uRowPitch && layout.rowPitch != m_uRowPitch ) )
++			{
++				rdx_log.errorf( "slot %u: offset %llu, row pitch %llu", i, (unsigned long long)layout.offset, (unsigned long long)layout.rowPitch );
++				SendAck( (uint32_t)layout.rowPitch, -EINVAL );
++				return false;
++			}
++			m_uRowPitch = (uint32_t)layout.rowPitch;
++			m_pSlotTex[ i ] = new CVulkanTexture();
++			if ( !m_pSlotTex[ i ]->BInitFromSwapchain( m_Images[ i ], m_Hello.width, m_Hello.height, VK_FORMAT_B8G8R8A8_UNORM ) )
++			{
++				SendAck( m_uRowPitch, -EIO );
++				return false;
++			}
++			return true;
++		}
++
++		// opaque fd -> linear image bound to the imported VRAM -> output texture
++		bool ImportVramSlots()
++		{
++			for ( uint32_t i = 0; i < m_Hello.nslots; i++ )
++			{
++				VkExternalMemoryImageCreateInfo extInfo = {
++					.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++					.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
++				};
++				VkMemoryRequirements req;
++				if ( !CreateLinearImage( i, &extInfo, &req ) )
++					return false;
++				uint32_t uType = FindType( req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
++				VkImportMemoryFdInfoKHR importInfo = {
++					.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
++					.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
++					.fd = m_nSlotFds[ i ],          // owned by Vulkan once the import succeeds
++				};
++				VkMemoryAllocateInfo allocInfo = {
++					.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &importInfo,
++					.allocationSize = m_Hello.slot_size, .memoryTypeIndex = uType,
++				};
++				VkResult res = g_device.vk.AllocateMemory( g_device.device(), &allocInfo, nullptr, &m_Memory[ i ] );
++				if ( res == VK_SUCCESS )
++					res = g_device.vk.BindImageMemory( g_device.device(), m_Images[ i ], m_Memory[ i ], 0 );
++				if ( res != VK_SUCCESS )
++				{
++					rdx_log.errorf( "import of slot %u failed: %d", i, res );
++					SendAck( 0, -EIO );
++					return false;
++				}
++				if ( !WrapSlotImage( i ) )
++					return false;
++			}
++			rdx_log.infof( "imported %u VRAM slots, row pitch %u", m_Hello.nslots, m_uRowPitch );
++			SendAck( m_uRowPitch, m_uRowPitch == m_Hello.stride ? 0 : -EINVAL );
++			return m_uRowPitch == m_Hello.stride;
++		}
++
++		// can the driver import a host pointer as a linear image we can composite into?
++		bool HostImageImportable()
++		{
++			VkPhysicalDeviceExternalImageFormatInfo extInfo = {
++				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
++				.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++			};
++			VkPhysicalDeviceImageFormatInfo2 info = {
++				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, .pNext = &extInfo,
++				.format = VK_FORMAT_B8G8R8A8_UNORM, .type = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_LINEAR,
++				.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++				         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++				.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT,
++			};
++			VkExternalImageFormatProperties extProps = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
++			VkImageFormatProperties2 props = { .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &extProps };
++			if ( g_device.vk.GetPhysicalDeviceImageFormatProperties2( g_device.physDev(), &info, &props ) != VK_SUCCESS )
++				return false;
++			return ( extProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT ) != 0;
++		}
++
++		// memfd -> mapping -> VK_EXT_external_memory_host import, as a buffer (composite into a
++		// VRAM image, then one copy into it; the default) or as a linear image (composite straight
++		// into host RAM; RDX_GS_HOST_DIRECT=1). Measured on the 2080 Ti behind the chipset, 1080p:
++		// present -> done 3.2 ms with the copy, 6.9 ms straight (the composite shader writes to
++		// host RAM much slower than the copy engine streams).
++		// Host slots handed over as dma-bufs (udmabuf of the memfd slots, the same pages the NIC
++		// reads): amdgpu imports a host pointer of anonymous memory only, not of a shared memfd
++		// mapping, so RADV takes the host buffers this way. Copy path only: composite into a VRAM
++		// image, one GPU copy into the imported buffer (CopyToHost), exactly as with a host pointer.
++		bool ImportDmabufSlots()
++		{
++			auto pfnFdProps = (PFN_vkGetMemoryFdPropertiesKHR)
++				g_device.vk.GetDeviceProcAddr( g_device.device(), "vkGetMemoryFdPropertiesKHR" );
++			m_pfnCopyImageToBuffer = (PFN_vkCmdCopyImageToBuffer)
++				g_device.vk.GetDeviceProcAddr( g_device.device(), "vkCmdCopyImageToBuffer" );
++			if ( !pfnFdProps || !m_pfnCopyImageToBuffer )
++			{
++				rdx_log.errorf( "VK_EXT_external_memory_dma_buf is not available on this device" );
++				SendAck( 0, -ENOTSUP, 1 );
++				return false;
++			}
++			rdx_log.infof( "host buffers as dma-bufs: composite into VRAM + one GPU copy into them" );
++			for ( uint32_t i = 0; i < m_Hello.nslots; i++ )
++			{
++				VkExternalMemoryBufferCreateInfo extInfo = {
++					.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
++					.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++				};
++				VkBufferCreateInfo bufInfo = {
++					.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &extInfo,
++					.size = m_Hello.slot_size, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++					.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++				};
++				VkResult res = g_device.vk.CreateBuffer( g_device.device(), &bufInfo, nullptr, &m_HostBuffer[ i ] );
++				VkMemoryRequirements req = {};
++				if ( res == VK_SUCCESS )
++					g_device.vk.GetBufferMemoryRequirements( g_device.device(), m_HostBuffer[ i ], &req );
++				VkMemoryFdPropertiesKHR fdProps = { .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR };
++				if ( res == VK_SUCCESS )
++					res = pfnFdProps( g_device.device(), VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, m_nSlotFds[ i ], &fdProps );
++				uint32_t uType = res == VK_SUCCESS ? FindType( req.memoryTypeBits & fdProps.memoryTypeBits, 0 ) : UINT32_MAX;
++				VkImportMemoryFdInfoKHR importInfo = {
++					.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
++					.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++					.fd = m_nSlotFds[ i ],          // owned by Vulkan once the import succeeds
++				};
++				VkMemoryAllocateInfo allocInfo = {
++					.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &importInfo,
++					.allocationSize = m_Hello.slot_size, .memoryTypeIndex = uType,
++				};
++				if ( res == VK_SUCCESS )
++					res = uType == UINT32_MAX ? VK_ERROR_FORMAT_NOT_SUPPORTED
++					                          : g_device.vk.AllocateMemory( g_device.device(), &allocInfo, nullptr, &m_Memory[ i ] );
++				if ( res == VK_SUCCESS )
++				{
++					m_nSlotFds[ i ] = -1;
++					res = g_device.vk.BindBufferMemory( g_device.device(), m_HostBuffer[ i ], m_Memory[ i ], 0 );
++				}
++				if ( res != VK_SUCCESS )
++				{
++					rdx_log.errorf( "import of dma-buf slot %u failed: %d (memory types 0x%x & 0x%x)", i, res,
++					                req.memoryTypeBits, fdProps.memoryTypeBits );
++					SendAck( 0, -EIO, 1 );
++					return false;
++				}
++				CVulkanTexture::createFlags flags;
++				flags.bStorage = true;
++				flags.bSampled = true;
++				flags.bTransferSrc = true;
++				flags.bOutputImage = true;
++				m_pSlotTex[ i ] = new CVulkanTexture();
++				if ( !m_pSlotTex[ i ]->BInit( m_Hello.width, m_Hello.height, 1u, VulkanFormatToDRM( VK_FORMAT_B8G8R8A8_UNORM ), flags ) )
++				{
++					rdx_log.errorf( "VRAM composite image for slot %u failed", i );
++					SendAck( 0, -ENOMEM, 1 );
++					return false;
++				}
++			}
++			rdx_log.infof( "imported %u dma-buf host slots, row pitch %u", m_Hello.nslots, m_Hello.stride );
++			SendAck( m_Hello.stride, 0, 1 );
++			return true;
++		}
++
++		bool ImportHostSlots()
++		{
++			if ( m_Hello.flags & RDX_GS_FLAG_DMABUF )
++				return ImportDmabufSlots();
++			auto pfnHostProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)
++				g_device.vk.GetDeviceProcAddr( g_device.device(), "vkGetMemoryHostPointerPropertiesEXT" );
++			m_pfnCopyImageToBuffer = (PFN_vkCmdCopyImageToBuffer)
++				g_device.vk.GetDeviceProcAddr( g_device.device(), "vkCmdCopyImageToBuffer" );
++			if ( !pfnHostProps || !m_pfnCopyImageToBuffer )
++			{
++				rdx_log.errorf( "VK_EXT_external_memory_host is not available on this device" );
++				SendAck( 0, -ENOTSUP );
++				return false;
++			}
++			VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostProps = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT };
++			VkPhysicalDeviceProperties2 props2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &hostProps };
++			g_device.vk.GetPhysicalDeviceProperties2( g_device.physDev(), &props2 );
++			const VkDeviceSize ulAlign = hostProps.minImportedHostPointerAlignment;
++			if ( ulAlign == 0 || m_Hello.slot_size % ulAlign != 0 )
++			{
++				rdx_log.errorf( "slot size %llu is not a multiple of the host pointer alignment %llu",
++				                (unsigned long long)m_Hello.slot_size, (unsigned long long)ulAlign );
++				SendAck( 0, -EINVAL );
++				return false;
++			}
++			const char *pszDirect = getenv( "RDX_GS_HOST_DIRECT" );
++			const bool bDirect = pszDirect && pszDirect[ 0 ] == '1' && HostImageImportable();
++			const uint32_t uPath = bDirect ? 0 : 1;
++			rdx_log.infof( "host buffers: %s (host pointer alignment %llu)",
++			               bDirect ? "composite straight into them (linear image on a host pointer)"
++			                       : "composite into VRAM + one GPU copy into them",
++			               (unsigned long long)ulAlign );
++
++			for ( uint32_t i = 0; i < m_Hello.nslots; i++ )
++			{
++				void *p = mmap( nullptr, m_Hello.slot_size, PROT_READ | PROT_WRITE, MAP_SHARED, m_nSlotFds[ i ], 0 );
++				close( m_nSlotFds[ i ] );
++				m_nSlotFds[ i ] = -1;
++				if ( p == MAP_FAILED )
++				{
++					rdx_log.errorf_errno( "mmap of host slot %u", i );
++					SendAck( 0, -ENOMEM, uPath );
++					return false;
++				}
++				m_pHostMap[ i ] = p;
++				VkMemoryHostPointerPropertiesEXT ptrProps = { .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
++				VkResult res = pfnHostProps( g_device.device(), VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, p, &ptrProps );
++				if ( res != VK_SUCCESS )
++				{
++					rdx_log.errorf( "vkGetMemoryHostPointerPropertiesEXT on slot %u: %d", i, res );
++					SendAck( 0, -EIO, uPath );
++					return false;
++				}
++				VkMemoryRequirements req;
++				if ( bDirect )
++				{
++					VkExternalMemoryImageCreateInfo extInfo = {
++						.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++						.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++					};
++					if ( !CreateLinearImage( i, &extInfo, &req ) )
++						return false;
++				}
++				else
++				{
++					VkExternalMemoryBufferCreateInfo extInfo = {
++						.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
++						.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++					};
++					VkBufferCreateInfo bufInfo = {
++						.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &extInfo,
++						.size = m_Hello.slot_size, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++						.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++					};
++					res = g_device.vk.CreateBuffer( g_device.device(), &bufInfo, nullptr, &m_HostBuffer[ i ] );
++					if ( res != VK_SUCCESS )
++					{
++						rdx_log.errorf( "vkCreateBuffer on a host pointer: %d", res );
++						SendAck( 0, -EINVAL, uPath );
++						return false;
++					}
++					g_device.vk.GetBufferMemoryRequirements( g_device.device(), m_HostBuffer[ i ], &req );
++				}
++				uint32_t uType = FindType( req.memoryTypeBits & ptrProps.memoryTypeBits, 0 );
++				VkImportMemoryHostPointerInfoEXT importInfo = {
++					.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
++					.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++					.pHostPointer = p,
++				};
++				VkMemoryAllocateInfo allocInfo = {
++					.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &importInfo,
++					.allocationSize = m_Hello.slot_size, .memoryTypeIndex = uType,
++				};
++				res = uType == UINT32_MAX ? VK_ERROR_FORMAT_NOT_SUPPORTED
++				                          : g_device.vk.AllocateMemory( g_device.device(), &allocInfo, nullptr, &m_Memory[ i ] );
++				if ( res == VK_SUCCESS )
++					res = bDirect ? g_device.vk.BindImageMemory( g_device.device(), m_Images[ i ], m_Memory[ i ], 0 )
++					              : g_device.vk.BindBufferMemory( g_device.device(), m_HostBuffer[ i ], m_Memory[ i ], 0 );
++				if ( res != VK_SUCCESS )
++				{
++					rdx_log.errorf( "import of host slot %u failed: %d (memory types 0x%x & 0x%x)", i, res,
++					                req.memoryTypeBits, ptrProps.memoryTypeBits );
++					SendAck( 0, -EIO, uPath );
++					return false;
++				}
++				if ( bDirect )
++				{
++					if ( !WrapSlotImage( i ) )
++						return false;
++					continue;
++				}
++				// the composite target of the copy path: an ordinary output image in VRAM
++				CVulkanTexture::createFlags flags;
++				flags.bStorage = true;
++				flags.bSampled = true;
++				flags.bTransferSrc = true;
++				flags.bOutputImage = true;
++				m_pSlotTex[ i ] = new CVulkanTexture();
++				if ( !m_pSlotTex[ i ]->BInit( m_Hello.width, m_Hello.height, 1u, VulkanFormatToDRM( VK_FORMAT_B8G8R8A8_UNORM ), flags ) )
++				{
++					rdx_log.errorf( "VRAM composite image for slot %u failed", i );
++					SendAck( 0, -ENOMEM, uPath );
++					return false;
++				}
++			}
++			// the copy writes rows at the sink stride (bufferRowLength), so it always matches
++			const uint32_t uPitch = bDirect ? m_uRowPitch : m_Hello.stride;
++			rdx_log.infof( "imported %u host slots, row pitch %u", m_Hello.nslots, uPitch );
++			SendAck( uPitch, uPitch == m_Hello.stride ? 0 : -EINVAL, uPath );
++			return uPitch == m_Hello.stride;
++		}
++
++		// composite image (VRAM, GENERAL layout after the composite) -> host buffer at the sink stride
++		std::optional<uint64_t> CopyToHost( int nSlot )
++		{
++			auto cmd = g_device.commandBuffer();
++			VkCommandBuffer cb = cmd->rawBuffer();
++			VkMemoryBarrier before = {
++				.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++				.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++			};
++			g_device.vk.CmdPipelineBarrier( cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++			                                1, &before, 0, nullptr, 0, nullptr );
++			VkBufferImageCopy region = {
++				.bufferOffset = 0, .bufferRowLength = m_Hello.stride / 4, .bufferImageHeight = 0,
++				.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++				.imageOffset = { 0, 0, 0 }, .imageExtent = { m_Hello.width, m_Hello.height, 1 },
++			};
++			m_pfnCopyImageToBuffer( cb, m_pSlotTex[ nSlot ]->vkImage(), VK_IMAGE_LAYOUT_GENERAL, m_HostBuffer[ nSlot ], 1, &region );
++			VkMemoryBarrier after = {
++				.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++				.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++			};
++			g_device.vk.CmdPipelineBarrier( cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
++			                                1, &after, 0, nullptr, 0, nullptr );
++			return g_device.submit( std::move( cmd ) );
++		}
++
++		// all GPU work done, then the slot images, memory, buffers and mappings go
++		void ReleaseSlots()
++		{
++			g_device.waitIdle();        // waits for every submission and releases their texture refs
++			g_device.garbageCollect();
++			for ( uint32_t i = 0; i < RDX_GS_MAX_SLOTS; i++ )
++			{
++				m_pSlotTex[ i ] = nullptr;
++				if ( m_Images[ i ] )
++					g_device.vk.DestroyImage( g_device.device(), m_Images[ i ], nullptr );
++				if ( m_HostBuffer[ i ] )
++					g_device.vk.DestroyBuffer( g_device.device(), m_HostBuffer[ i ], nullptr );
++				if ( m_Memory[ i ] )
++					g_device.vk.FreeMemory( g_device.device(), m_Memory[ i ], nullptr );
++				if ( m_pHostMap[ i ] )
++					munmap( m_pHostMap[ i ], m_Hello.slot_size );
++				m_Images[ i ] = VK_NULL_HANDLE;
++				m_HostBuffer[ i ] = VK_NULL_HANDLE;
++				m_Memory[ i ] = VK_NULL_HANDLE;
++				m_pHostMap[ i ] = nullptr;
++			}
++		}
++
++		// paint thread: new client mode and buffers from RECONFIG
++		void ApplyReconfig()
++		{
++			std::lock_guard<std::mutex> lock( m_ReconfigMutex );
++			m_bReconfig = false;
++			const uint32_t uOldW = m_Hello.width, uOldH = m_Hello.height, uOldR = m_Hello.refresh_mhz;
++			ReleaseSlots();
++			m_Hello = m_PendingHello;
++			memcpy( m_nSlotFds, m_nPendingFds, sizeof( int ) * m_Hello.nslots );
++			m_uRowPitch = 0;
++			m_uFreeMask = 0;
++			m_uLastSlot = m_Hello.nslots - 1;
++			m_uGen++;
++			if ( !ImportSlots() )      // sends the ACK; on failure rdx_gs_src ends the session
++				return;
++			if ( m_bStream )           // the monitor keeps its mode, only the stream's size changes
++			{
++				rdx_log.infof( "stream RECONFIG (generation %u): %ux%u -> %ux%u", m_uGen, uOldW, uOldH,
++				               m_Hello.width, m_Hello.height );
++				UpdateStreamVrr( ( m_Hello.flags & RDX_GS_FLAG_VRR ) != 0, "RECONFIG" );
++				return;
++			}
++			g_nOutputWidth = m_Hello.width;
++			g_nOutputHeight = m_Hello.height;
++			g_nOutputRefresh = m_Hello.refresh_mhz;
++			g_nNestedRefresh = m_Hello.refresh_mhz;
++			UpdateVrr();
++			rdx_log.infof( "RECONFIG (generation %u): %ux%u @ %.3f Hz -> %ux%u @ %.3f Hz, %u slots", m_uGen,
++			               uOldW, uOldH, uOldR / 1000.0, m_Hello.width, m_Hello.height, m_Hello.refresh_mhz / 1000.0,
++			               m_Hello.nslots );
++			force_repaint();
++		}
++
++		void RecvThread()
++		{
++			pthread_setname_np( pthread_self(), "gamescope-rdx" );
++			RecvLoop();
++			if ( m_bRunning )
++			{
++				rdx_log.infof( "rdx_gs_src ended the session (%llu frames, %llu without a free slot)",
++				               (unsigned long long)m_ulFrames, (unsigned long long)m_ulNoSlot );
++				raise( SIGTERM );
++			}
++		}
++
++		// messages from rdx_gs_src until it ends the session (BYE, socket closed)
++		void RecvLoop()
++		{
++			while ( m_bRunning )
++			{
++				union { rdx_gs_msg msg; rdx_gs_hello hello; } u;
++				alignas( cmsghdr ) char cbuf[ CMSG_SPACE( sizeof( int ) * RDX_GS_MAX_SLOTS ) ];
++				iovec iov = { .iov_base = &u, .iov_len = sizeof( u ) };
++				msghdr mh = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = cbuf, .msg_controllen = sizeof( cbuf ) };
++				ssize_t n = recvmsg( m_nSocket, &mh, MSG_CMSG_CLOEXEC );
++				if ( n <= 0 )
++					break;
++				if ( n == (ssize_t)sizeof( rdx_gs_hello ) && u.hello.magic == RDX_GS_MAGIC && u.hello.type == RDX_GS_RECONFIG )
++				{
++					cmsghdr *c = CMSG_FIRSTHDR( &mh );
++					if ( u.hello.nslots == 0 || u.hello.nslots > RDX_GS_MAX_SLOTS || u.hello.buf_kind != m_Hello.buf_kind ||
++					     !c || c->cmsg_type != SCM_RIGHTS || c->cmsg_len != CMSG_LEN( sizeof( int ) * u.hello.nslots ) )
++					{
++						rdx_log.errorf( "invalid RECONFIG from rdx_gs_src" );
++						SendAck( 0, -EINVAL );
++						continue;
++					}
++					std::lock_guard<std::mutex> lock( m_ReconfigMutex );
++					m_PendingHello = u.hello;
++					memcpy( m_nPendingFds, CMSG_DATA( c ), sizeof( int ) * u.hello.nslots );
++					m_bReconfig = true;
++					force_repaint();        // the paint thread applies it
++					continue;
++				}
++				rdx_gs_msg &msg = u.msg;
++				if ( n != (ssize_t)sizeof( msg ) || msg.magic != RDX_GS_MAGIC )
++					continue;
++				if ( msg.type == RDX_GS_FREE && msg.slot < m_Hello.nslots )
++					GiveSlot( (int)msg.slot );
++				else if ( msg.type == RDX_GS_VBLANK && ( m_bStream ? RdxClientLeads() : !m_bVrr.load() ) )
++					GetVBlankTimer().MarkVBlank( msg.t_ns, true );
++				else if ( msg.type == RDX_GS_VRR && m_bStream )
++					UpdateStreamVrr( msg.slot != 0, "RDX_GS_VRR" );     // the client's screen changed
++				else if ( msg.type == RDX_GS_VRR && !m_bStream )
++				{
++					// variable refresh on / off with the same buffers: the paint thread applies it
++					m_uPendingVrrMhz = (uint32_t)msg.t_ns;
++					m_bPendingVrrOn = msg.slot != 0;
++					m_bVrrChange = true;
++					force_repaint();
++				}
++				else if ( msg.type == RDX_GS_CURSOR && !m_bStream )
++					SetCursorSeparate( msg.slot != 0 );
++				else if ( msg.type == RDX_GS_INPUT && !m_bStream )
++				{
++					// the stream detached (the app waits in the background, maybe next to another app's
++					// gamescope in the stream) or attached again: the input thread lets go / reads again
++					m_bInputWanted = msg.slot != 0;
++					if ( m_nInputWake[ 1 ] >= 0 && write( m_nInputWake[ 1 ], "x", 1 ) != 1 && errno != EAGAIN )
++						rdx_log.errorf_errno( "waking the input thread" );
++				}
++				else if ( msg.type == RDX_GS_BYE )
++					break;
++			}
++		}
++
++	public:
++		/////////////////////////////////////////////////////////////////
++		// stream mode (add-on output next to another backend)
++		/////////////////////////////////////////////////////////////////
++
++		void StartStream( const char *pszPath )
++		{
++			m_strStreamPath = pszPath;
++			m_StreamThread = std::thread( [this]() { StreamThread(); } );
++			rdx_log.infof( "stream add-on: waiting for rdx_gs_src on %s", pszPath );
++		}
++
++		bool StreamActive() const { return m_eStream.load() == StreamState::Active; }
++
++		// the stream to a client with variable refresh (RDX_GS_FLAG_VRR in its hello, RDX_GS_VRR later): the
++		// client shows each frame on arrival and sends no vblank, so it never leads; the seat's monitor
++		// (gamescope --adaptive-sync on a vrr_capable connector) flips at the app's pace and every painted
++		// frame goes out. rdx-hostd asks for it only when the seat's monitor reports vrr_capable.
++		bool StreamVrr() const { return m_bStreamVrr.load(); }
++
++		void UpdateStreamVrr( bool bWant, const char *pszWhy )
++		{
++			const char *pszEnv = getenv( "RDX_GS_VRR" );
++			const bool bVrr = bWant && !( m_Hello.flags & RDX_GS_FLAG_TEARING ) && !( pszEnv && !strcmp( pszEnv, "0" ) );
++			if ( m_bStreamVrr.exchange( bVrr ) == bVrr && strcmp( pszWhy, "attach" ) )
++				return;
++			if ( !bVrr )
++			{
++				if ( bWant )
++					rdx_log.infof( "stream variable refresh: off (%s; RDX_GS_VRR=0 or tearing), the clock follows the input",
++					               pszWhy );
++				return;
++			}
++			gamescope::IBackendConnector *pConn = GetBackend() ? GetBackend()->GetCurrentConnector() : nullptr;
++			const bool bMonVrr = pConn && pConn->SupportsVRR();
++			rdx_log.infof( "stream variable refresh: on (%s), up to %.3f Hz; the seat's monitor %s", pszWhy,
++			               m_Hello.refresh_mhz / 1000.0,
++			               !bMonVrr ? "has no variable refresh: its fixed refresh paces the app"
++			               : cv_adaptive_sync ? "runs adaptive sync and paces the app"
++			               : "could, but adaptive sync is off (--adaptive-sync / GAMESCOPE_VRR_ENABLED): its fixed refresh paces the app" );
++		}
++
++		// steamcompmgr's relative-mouse rule for the stream's rdx_gs_src (any thread). Without an attached
++		// stream nothing is sent and the state is forgotten: the next session starts absolute and is told again.
++		void StreamSetRelativeMouse( bool bRelative )
++		{
++			if ( StreamActive() )
++				m_StreamHint.Set( this, bRelative, "stream pointer hint" );
++			else
++				m_StreamHint.Reset();
++		}
++
++		// paint thread: state changes that need Vulkan, then a free slot (nullptr: none / inactive)
++		gamescope::Rc<CVulkanTexture> StreamBegin( int *pnSlot )
++		{
++			std::unique_lock<std::mutex> lock( m_StreamMutex );
++			const StreamState eState = m_eStream.load();
++			if ( eState == StreamState::Attaching )
++			{
++				m_uRowPitch = 0;
++				m_uFreeMask = 0;
++				m_uLastSlot = m_Hello.nslots - 1;
++				m_ulStreamFrames = 0;
++				const bool bSameGpu = StreamSameGpu();
++				if ( bSameGpu && ImportSlots() )      // ACK sent; rdx_gs_src then frees every slot
++				{
++					UpdateStreamVrr( ( m_Hello.flags & RDX_GS_FLAG_VRR ) != 0, "attach" );
++					m_eStream = StreamState::Active;
++					rdx_log.infof( "stream attached: %ux%u @ %.3f Hz, %u %s slots, clock: %s", m_Hello.width, m_Hello.height,
++					               m_Hello.refresh_mhz / 1000.0, m_Hello.nslots,
++					               m_Hello.buf_kind == RDX_GS_BUF_HOST ? "host" : "VRAM",
++					               m_bStreamVrr.load() ? "the monitor (variable refresh on both screens)" : RdxClockMode() );
++				}
++				else
++				{
++					if ( !bSameGpu )
++						SendAck( 0, -ENODEV );
++					ReleaseSlots();
++					shutdown( m_nSocket, SHUT_RDWR );
++					m_eStream = StreamState::Detaching;
++				}
++				m_StreamCv.notify_all();
++				return nullptr;
++			}
++			if ( eState == StreamState::Detaching )
++			{
++				ReleaseSlots();
++				m_eStream = StreamState::Idle;
++				m_StreamCv.notify_all();
++				return nullptr;
++			}
++			if ( eState != StreamState::Active )
++				return nullptr;
++			lock.unlock();
++			if ( m_bReconfig.load() )
++			{
++				ApplyReconfig();
++				return nullptr;
++			}
++			int nSlot = TakeFreeSlot();
++			if ( nSlot < 0 )
++			{
++				m_ulNoSlot++;
++				return nullptr;
++			}
++			*pnSlot = nSlot;
++			return m_pSlotTex[ nSlot ];
++		}
++
++		// paint thread: the stream composite of slot nSlot was submitted (oSeq) -> host copy, READY
++		void StreamEnd( int nSlot, std::optional<uint64_t> oSeq, uint64_t ulBegin )
++		{
++			if ( oSeq && m_HostBuffer[ nSlot ] != VK_NULL_HANDLE )
++				oSeq = CopyToHost( nSlot );
++			if ( !oSeq )
++			{
++				GiveSlot( nSlot );
++				return;
++			}
++			vulkan_wait( *oSeq, true );
++			const uint64_t ulDone = get_time_in_nanos();
++			rdx_gs_msg msg = {
++				.magic = RDX_GS_MAGIC, .type = RDX_GS_READY, .slot = (uint32_t)nSlot, .pad = m_uGen,
++				.seq = m_ulFrames++, .t_ns = ulDone, .t_begin_ns = ulBegin,
++			};
++			if ( send( m_nSocket, &msg, sizeof( msg ), MSG_NOSIGNAL ) != (ssize_t)sizeof( msg ) )
++				GiveSlot( nSlot );       // rdx_gs_src is going away; the receive loop sees it
++			m_ulStreamFrames++;
++		}
++
++		uint32_t StreamWidth() const { return m_Hello.width; }
++		uint32_t StreamRefresh() const { return m_Hello.refresh_mhz; }
++		uint32_t StreamHeight() const { return m_Hello.height; }
++
++	private:
++		enum class StreamState { Idle, Attaching, Active, Detaching };
++
++		// the slots of rdx_gs_src live on (or are written by) its GPU: it must be ours
++		bool StreamSameGpu()
++		{
++			VkPhysicalDeviceIDProperties idProps = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
++			VkPhysicalDeviceProperties2 props = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &idProps };
++			g_device.vk.GetPhysicalDeviceProperties2( g_device.physDev(), &props );
++			if ( memcmp( idProps.deviceUUID, m_Hello.gpu_uuid, VK_UUID_SIZE ) == 0 )
++				return true;
++			rdx_log.errorf( "stream refused: rdx_gs_src uses another GPU than %s (rdx_gs_src --gpu <this GPU>)",
++			                props.properties.deviceName );
++			return false;
++		}
++
++		// waits for the paint thread to leave eState (it runs at least at every repaint we ask for)
++		void StreamWaitPaint( StreamState eState )
++		{
++			std::unique_lock<std::mutex> lock( m_StreamMutex );
++			while ( m_bRunning && m_eStream.load() == eState )
++			{
++				force_repaint();
++				m_StreamCv.wait_for( lock, std::chrono::milliseconds( 100 ) );
++			}
++		}
++
++		void StreamThread()
++		{
++			pthread_setname_np( pthread_self(), "gamescope-rdxs" );
++			while ( m_bRunning )
++			{
++				if ( !Connect( m_strStreamPath.c_str(), true ) )
++				{
++					if ( m_nSocket >= 0 )          // connected, but no valid hello
++					{
++						close( m_nSocket );
++						m_nSocket = -1;
++					}
++					std::unique_lock<std::mutex> lock( m_StreamMutex );
++					m_StreamCv.wait_for( lock, std::chrono::milliseconds( 500 ) );
++					continue;
++				}
++				m_eStream = StreamState::Attaching;
++				StreamWaitPaint( StreamState::Attaching );
++				if ( m_eStream.load() == StreamState::Active )
++					RecvLoop();
++				rdx_log.infof( "stream detached (%llu frames, %llu without a free slot)",
++				               (unsigned long long)m_ulStreamFrames, (unsigned long long)m_ulNoSlot );
++				if ( m_eStream.load() == StreamState::Active )
++					m_eStream = StreamState::Detaching;
++				StreamWaitPaint( StreamState::Detaching );
++				close( m_nSocket );
++				m_nSocket = -1;
++				m_ulNoSlot = 0;
++			}
++		}
++
++		void InputThread()
++		{
++			pthread_setname_np( pthread_self(), "gamescope-rdx-in" );
++			pollfd p[ 4 ] = { { .fd = m_nInputStop[ 0 ], .events = POLLIN },
++			                  { .fd = m_pLibInput ? m_pLibInput->GetFD() : -1, .events = POLLIN },
++			                  { .fd = m_pLibInputPrivate ? m_pLibInputPrivate->GetFD() : -1, .events = POLLIN },
++			                  { .fd = m_nInputWake[ 0 ], .events = POLLIN } };
++			// no event before the Wayland server runs: its seat does not exist yet, and a mouse that
++			// already moves (a client's streamed mouse, another session's on seat0) crashed gamescope in
++			// wlr_relative_pointer_manager_v1_send_relative_motion (NULL seat; the SDL backend waits too)
++			while ( m_bRunning && !wlserver.bWaylandServerRunning )
++			{
++				if ( poll( p, 1, 50 ) > 0 && p[ 0 ].revents )
++					return;
++			}
++			while ( m_bRunning && wlserver.bWaylandServerRunning )
++			{
++				if ( poll( p, 4, -1 ) < 0 && errno != EINTR )
++					break;
++				if ( p[ 0 ].revents )
++					break;
++				if ( p[ 3 ].revents & POLLIN )
++				{
++					// RDX_GS_INPUT: detached = every device closed and its grab released, so the gamescope
++					// of the app in the stream gets the client's devices alone (rdma-display hostd
++					// "suspend_multi" looks for the marker in this line's format)
++					char b[ 16 ];
++					while ( read( m_nInputWake[ 0 ], b, sizeof( b ) ) > 0 )
++						;
++					const bool bWant = m_bInputWanted.load();
++					if ( bWant != m_bInputOn )
++					{
++						m_bInputOn = bWant;
++						if ( m_pLibInput )
++							m_pLibInput->Suspend( !bWant );
++						if ( m_pLibInputPrivate )
++							m_pLibInputPrivate->Suspend( !bWant );
++						rdx_log.infof( "input: %s (RDX_GS_INPUT v1)", bWant ? "reading the client's devices again (stream attached)"
++						                                                    : "every device let go (stream detached, the app waits in the background)" );
++					}
++				}
++				if ( p[ 1 ].revents & POLLIN )
++					m_pLibInput->OnPollIn();
++				if ( p[ 2 ].revents & POLLIN )
++					m_pLibInputPrivate->OnPollIn();
++			}
++		}
++
++		int TakeFreeSlot()
++		{
++			// round robin from the last slot, so the client sees slots in order
++			uint32_t uMask = m_uFreeMask.load();
++			for ( uint32_t k = 1; k <= m_Hello.nslots; k++ )
++			{
++				uint32_t s = ( m_uLastSlot + k ) % m_Hello.nslots;
++				if ( uMask & ( 1u << s ) )
++				{
++					m_uFreeMask.fetch_and( ~( 1u << s ) );
++					m_uLastSlot = s;
++					return (int)s;
++				}
++			}
++			return -1;
++		}
++		void GiveSlot( int nSlot ) { m_uFreeMask.fetch_or( 1u << nSlot ); }
++
++		CRdxConnector m_Connector;
++		rdx_gs_hello m_Hello{};
++		int m_nSocket = -1;
++		int m_nSlotFds[ RDX_GS_MAX_SLOTS ] = {};
++		VkImage m_Images[ RDX_GS_MAX_SLOTS ] = {};
++		VkDeviceMemory m_Memory[ RDX_GS_MAX_SLOTS ] = {};
++		OwningRc<CVulkanTexture> m_pSlotTex[ RDX_GS_MAX_SLOTS ];
++		void *m_pHostMap[ RDX_GS_MAX_SLOTS ] = {};
++		VkBuffer m_HostBuffer[ RDX_GS_MAX_SLOTS ] = {};
++		uint32_t m_uRowPitch = 0;
++		PFN_vkCmdCopyImageToBuffer m_pfnCopyImageToBuffer = nullptr;
++		std::atomic<uint32_t> m_uFreeMask = { 0 };
++		uint32_t m_uLastSlot = RDX_GS_MAX_SLOTS - 1;
++		uint64_t m_ulFrames = 0;
++		uint64_t m_ulNoSlot = 0;
++		uint64_t m_ulLastShape = 0;
++		std::mutex m_ReconfigMutex;
++		std::atomic<bool> m_bReconfig = { false };
++		rdx_gs_hello m_PendingHello{};
++		int m_nPendingFds[ RDX_GS_MAX_SLOTS ] = {};
++		uint32_t m_uGen = 0;
++		int m_nShapeLogs = 0;
++		std::atomic<bool> m_bVrr = { false };      // RDX_GS_FLAG_VRR in effect (UpdateVrr)
++		std::atomic<bool> m_bStreamVrr = { false };    // stream add-on: the client has variable refresh (UpdateStreamVrr)
++		uint64_t m_ulLastFlip = 0;                 // paint thread: the last variable refresh "flip" (MarkVrrFlip)
++		bool m_bVrrAppOffLogged = false;
++		std::atomic<bool> m_bVrrChange = { false };     // RDX_GS_VRR received, ApplyVrrChange pending
++		std::atomic<bool> m_bPendingVrrOn = { false };
++		std::atomic<uint32_t> m_uPendingVrrMhz = { 0 };
++		std::atomic<bool> m_bRunning = { true };
++		std::thread m_RecvThread;
++		std::unique_ptr<CLibInputHandler> m_pLibInput;
++		std::unique_ptr<CLibInputHandler> m_pLibInputPrivate;
++		int m_nInputStop[ 2 ] = { -1, -1 };
++		int m_nInputWake[ 2 ] = { -1, -1 };          // RDX_GS_INPUT wakes the input thread
++		std::atomic<bool> m_bInputWanted = { true };
++		bool m_bInputOn = true;                      // input thread only
++		std::thread m_InputThread;
++
++		const bool m_bStream = false;
++		std::string m_strStreamPath;
++		std::thread m_StreamThread;
++		std::mutex m_StreamMutex;
++		std::condition_variable m_StreamCv;
++		std::atomic<StreamState> m_eStream = { StreamState::Idle };
++		uint64_t m_ulStreamFrames = 0;
++		CRdxHintSender m_StreamHint;
++
++		// the cursor next to the picture
++		std::atomic<bool> m_bCursorSep = { false };
++		std::atomic<bool> m_bCursorResync = { false };
++		std::mutex m_CursorMutex;                  // the CURIMG / CURPOS packets in order, the state below
++		std::shared_ptr<INestedHints::CursorInfo> m_pCursorInfo;
++		uint32_t m_uCursorSerial = 0;
++		bool m_bCursorImagePending = false;
++		uint32_t m_uCursorImageOff = 0;            // the next chunk of a picture the socket did not take whole
++		bool m_bCursorLogged = false;
++		bool m_bCursorSent = false;                // the last CURPOS: what the client knows
++		int32_t m_nCursorX = 0, m_nCursorY = 0;
++		bool m_bCursorVisible = false;
++		uint32_t m_uCursorSentSerial = 0;
++	};
++
++	// X11 apps (Steam's steamwebhelper/Chromium, Proton games) reach us through Xwayland. On
++	// NVIDIA there is no implicit sync, so without explicit sync we may sample an X11 window's
++	// buffer before the GPU has finished drawing it: whole frames of the clear colour (black or
++	// white) between real ones, i.e. heavy flicker in continuous animations such as Steam's
++	// screen saver (measured on a client: 1029 black + 82 white of 1554 frames).
++	// Xwayland >= 24.1 passes wp_linux_drm_syncobj_v1 acquire/release points, which gamescope
++	// takes wherever the backend supports explicit sync (rdx, DRM). Distributions with an older
++	// Xwayland (Ubuntu 24.04: 23.2) get one installed next to gamescope; wlroots starts it via
++	// WLR_XWAYLAND. Called by main() for every backend (the seat's own monitor runs DRM).
++	void RdxPickXwayland()
++	{
++		if ( const char *pszSet = getenv( "WLR_XWAYLAND" ); pszSet && *pszSet )
++		{
++			rdx_log.infof( "Xwayland: %s (WLR_XWAYLAND)", pszSet );
++			return;
++		}
++		char szPath[ PATH_MAX ];
++		ssize_t n = readlink( "/proc/self/exe", szPath, sizeof( szPath ) - 16 );
++		char *pszSlash = n > 0 ? (char *)memrchr( szPath, '/', (size_t)n ) : nullptr;
++		if ( pszSlash )
++		{
++			strcpy( pszSlash + 1, "Xwayland" );
++			if ( access( szPath, X_OK ) == 0 )
++			{
++				setenv( "WLR_XWAYLAND", szPath, 1 );
++				rdx_log.infof( "Xwayland: %s (next to gamescope, explicit sync)", szPath );
++				return;
++			}
++		}
++		rdx_log.infof( "Xwayland: the system's (no Xwayland next to gamescope); before 24.1 it has no "
++		               "explicit sync, and X11 apps on NVIDIA may flicker" );
++	}
++
++	/////////////////////////
++	// Stream add-on and clock
++	/////////////////////////
++
++	static CRdxBackend *s_pRdxStream = nullptr;
++	// 1: the last keyboard/pointer/touch event came from rdx_input_rx (the client), 0: local
++	static std::atomic<int> s_nRdxInputRemote = { 0 };
++	// RDX_GS_CLOCK=client|monitor pins the clock (tests, or a seat whose inputs cannot be told
++	// apart); unset/auto: the side of the last input
++	static int s_nRdxClockPinned = -1;
++
++	void RdxStreamInit( bool bRdxBackend )
++	{
++		const char *pszPath = getenv( "RDX_GS_STREAM_SOCKET" );
++		if ( bRdxBackend || !pszPath || !*pszPath )
++			return;
++		if ( const char *pszClock = getenv( "RDX_GS_CLOCK" ) )
++			s_nRdxClockPinned = !strcmp( pszClock, "client" ) ? 1 : !strcmp( pszClock, "monitor" ) ? 0 : -1;
++		s_pRdxStream = new CRdxBackend( true );
++		s_pRdxStream->StartStream( pszPath );
++	}
++
++	void RdxNoteInput( const char *pszDevice )
++	{
++		const int nRemote = pszDevice && !strncmp( pszDevice, "rdx:", 4 ) ? 1 : 0;
++		if ( s_nRdxInputRemote.exchange( nRemote ) != nRemote && s_pRdxStream && s_pRdxStream->StreamActive() )
++			rdx_log.infof( "clock: the %s leads (input from %s)", nRemote ? "client" : "monitor", pszDevice ? pszDevice : "?" );
++	}
++
++	const char *RdxClockMode()
++	{
++		return s_nRdxClockPinned == 1 ? "client (RDX_GS_CLOCK)" : s_nRdxClockPinned == 0 ? "monitor (RDX_GS_CLOCK)"
++		                                                                 : "the side of the last input";
++	}
++
++	int RdxLeadingClientRefresh()
++	{
++		return RdxClientLeads() ? (int)s_pRdxStream->StreamRefresh() : 0;
++	}
++
++	bool RdxGrabInput()
++	{
++		static const bool s_bGrab = []()
++		{
++			const char *pszGrab = getenv( "RDX_GS_GRAB" );
++			const bool bGrab = !( pszGrab && !strcmp( pszGrab, "0" ) );
++			rdx_log.infof( "input: %s", bGrab ? "keyboards and pointers grabbed (EVIOCGRAB): no other reader, "
++			                                    "not the host's console, sees them" : "not grabbed (RDX_GS_GRAB=0)" );
++			return bGrab;
++		}();
++		return s_bGrab;
++	}
++
++	void RdxGrabEvdev( int nFd, const char *pszWhat, bool bClientOnly )
++	{
++		if ( nFd < 0 || !RdxGrabInput() )
++			return;
++		auto testBit = []( const uint8_t *pBits, unsigned n ) { return ( pBits[ n / 8 ] >> ( n % 8 ) ) & 1; };
++		uint8_t keys[ KEY_CNT / 8 + 1 ] = {}, rels[ REL_CNT / 8 + 1 ] = {};
++		char szName[ 128 ] = "";
++		if ( ioctl( nFd, EVIOCGBIT( EV_KEY, sizeof( keys ) ), keys ) < 0 )
++			return;                                          // not an evdev node
++		ioctl( nFd, EVIOCGBIT( EV_REL, sizeof( rels ) ), rels );
++		ioctl( nFd, EVIOCGNAME( sizeof( szName ) - 1 ), szName );
++		bool bJoystick = false, bKeys = false;
++		for ( unsigned k = BTN_JOYSTICK; k < BTN_DIGI; k++ )            // joystick and gamepad buttons
++			bJoystick |= testBit( keys, k );
++		for ( unsigned k = KEY_ESC; k < BTN_MISC; k++ )                 // what the VT keyboard handler takes
++			bKeys |= testBit( keys, k );
++		const bool bPointer = testBit( rels, REL_X ) || testBit( keys, BTN_LEFT );
++		if ( bJoystick || !( bKeys || bPointer ) )
++			return;
++		if ( bClientOnly )
++		{
++			// the client's devices only: rdx_input_rx's mirrors and a local window's ("rdx: ..."),
++			// rdx_usb_host's uhid devices (phys "rdx:..."), USB/IP (vhci_hcd). Other virtual devices
++			// (Steam Input's, a desktop's own tools) are read as before but never taken away
++			struct stat st;
++			char szSys[ 64 ], szReal[ PATH_MAX ] = "", szPhys[ 128 ] = "";
++			ioctl( nFd, EVIOCGPHYS( sizeof( szPhys ) - 1 ), szPhys );
++			if ( fstat( nFd, &st ) == 0 )
++			{
++				snprintf( szSys, sizeof( szSys ), "/sys/dev/char/%u:%u", major( st.st_rdev ), minor( st.st_rdev ) );
++				if ( !realpath( szSys, szReal ) )
++					szReal[ 0 ] = 0;
++			}
++			if ( strncmp( szName, "rdx:", 4 ) && strncmp( szPhys, "rdx:", 4 ) && !strstr( szReal, "/vhci_hcd" ) )
++				return;
++		}
++		for ( int i = 0; ; i++ )
++		{
++			if ( ioctl( nFd, EVIOCGRAB, 1 ) == 0 )
++			{
++				rdx_log.infof( "input: grabbed \"%s\" (%s)", szName, pszWhat );
++				return;
++			}
++			if ( errno != EBUSY )
++				break;
++			// ours already (wlroots: a keyboard and a pointer of one device share the fd)? Releasing
++			// works only for the holder
++			if ( ioctl( nFd, EVIOCGRAB, 0 ) == 0 )
++			{
++				ioctl( nFd, EVIOCGRAB, 1 );
++				return;
++			}
++			errno = EBUSY;
++			if ( i >= 250 )                    // up to 0.5 s: probes of rdx_input_rx and seatmgr under load
++				break;
++			usleep( 2000 );
++		}
++		rdx_log.errorf( "input: could not grab \"%s\" (%s): %s; the host's console may see its keys",
++		                szName, pszWhat, strerror( errno ) );
++	}
++
++	bool RdxClientLeads()
++	{
++		if ( !s_pRdxStream || !s_pRdxStream->StreamActive() )
++			return false;
++		if ( s_pRdxStream->StreamVrr() )   // a variable refresh client sends no vblank: the monitor paces
++			return false;
++		return s_nRdxClockPinned >= 0 ? s_nRdxClockPinned == 1 : s_nRdxInputRemote.load() == 1;
++	}
++
++	gamescope::Rc<CVulkanTexture> RdxStreamBegin( int *pnSlot, uint32_t *puWidth, uint32_t *puHeight )
++	{
++		if ( !s_pRdxStream )
++			return nullptr;
++		gamescope::Rc<CVulkanTexture> pTex = s_pRdxStream->StreamBegin( pnSlot );
++		if ( pTex )
++		{
++			*puWidth = s_pRdxStream->StreamWidth();
++			*puHeight = s_pRdxStream->StreamHeight();
++		}
++		return pTex;
++	}
++
++	void RdxStreamEnd( int nSlot, std::optional<uint64_t> oSeq, uint64_t ulBegin )
++	{
++		if ( s_pRdxStream )
++			s_pRdxStream->StreamEnd( nSlot, oSeq, ulBegin );
++	}
++
++	void RdxStreamSetRelativeMouse( bool bRelative )
++	{
++		if ( s_pRdxStream )
++			s_pRdxStream->StreamSetRelativeMouse( bRelative );
++	}
++
++	int CRdxConnector::Present( const FrameInfo_t *pFrameInfo, bool bAsync )
++	{
++		return m_pBackend->PresentToSlot( pFrameInfo );
++	}
++
++	// the client's screen has variable refresh (RDX_GS_FLAG_VRR): Steam sees GAMESCOPE_VRR_CAPABLE, steamcompmgr
++	// takes its adaptive sync path while it is active
++	bool CRdxConnector::SupportsVRR() const { return m_pBackend->VrrActive(); }
++	bool CRdxConnector::IsVRRActive() const { return m_pBackend->VrrActive(); }
++
++	void CRdxHints::SetCursorImage( std::shared_ptr<CursorInfo> info )
++	{
++		m_pBackend->CursorImage( std::move( info ) );
++	}
++
++	bool CRdxHints::ShouldPaintCursor()
++	{
++		return !m_pBackend->CursorSeparate();
++	}
++
++	bool RdxCursorSeparate()
++	{
++		return s_pRdxBackend && s_pRdxBackend->CursorSeparate();
++	}
++
++	void RdxCursorMoved()
++	{
++		if ( s_pRdxBackend )
++			s_pRdxBackend->CursorPosition( false );
++	}
++
++	bool RdxCursorTakeResync()
++	{
++		return s_pRdxBackend && s_pRdxBackend->CursorTakeResync();
++	}
++
++	void RdxCursorTick()
++	{
++		if ( s_pRdxBackend )
++			s_pRdxBackend->CursorTick();
++	}
++
++	// steamcompmgr calls this on every pass of its loop: only a change is sent
++	void CRdxHints::SetRelativeMouseMode( bool bRelative )
++	{
++		m_Sender.Set( m_pBackend, bRelative, "pointer hint" );
++	}
++
++	void CRdxHintSender::Set( CRdxBackend *pBackend, bool bRelative, const char *pszWho )
++	{
++		std::lock_guard<std::mutex> lock( m_Mutex );
++		if ( bRelative == m_bRelative )
++			return;
++		if ( !pBackend->SendHint( bRelative ? RDX_GS_HINT_REL_MOUSE : 0u ) )
++		{
++			// not recorded, so the next pass sends it again
++			if ( !m_bLogged )
++			{
++				m_bLogged = true;
++				rdx_log.errorf_errno( "%s (%s) to rdx_gs_src failed, retrying", pszWho, bRelative ? "relative" : "absolute" );
++			}
++			return;
++		}
++		m_bLogged = false;
++		m_bRelative = bRelative;
++		rdx_log.infof( "%s: %s", pszWho, bRelative ? "relative (cursor hidden, pointer locked)" : "absolute" );
++	}
++
++	/////////////////////////
++	// Backend Instantiator
++	/////////////////////////
++
++	template <>
++	bool IBackend::Set<CRdxBackend>()
++	{
++		return Set( new CRdxBackend{} );
++	}
++}
+diff --git a/src/Backends/rdx_gs_proto.h b/src/Backends/rdx_gs_proto.h
+new file mode 100644
+--- /dev/null
++++ b/src/Backends/rdx_gs_proto.h
+@@ -0,0 +1,136 @@
++/* rdx_gs_src <-> gamescope "rdx" backend, over a unix SOCK_SEQPACKET socket.
++ *
++ * rdx_gs_src owns the output buffers, one per sink slot, linear, stride = sink stride:
++ *  - RDX_GS_BUF_VRAM: CUDA VMM allocations, handed over as opaque fds; gamescope imports
++ *    them as Vulkan images and composites into them; the NIC reads the same VRAM.
++ *  - RDX_GS_BUF_HOST: pinned host memory (memfd, mlocked, registered with the NIC);
++ *    gamescope maps the memfd and imports the pointer (VK_EXT_external_memory_host).
++ *    The GPU writes the frame over PCIe (posted writes), the NIC reads host RAM: no
++ *    peer read of VRAM at all.
++ *
++ *   src -> gs  HELLO  (+ SCM_RIGHTS: nslots opaque fds, slot order)
++ *   gs  -> src ACK    row pitch of the imported images (must equal stride)
++ *   src -> gs  FREE   slot may be composited into (initially all slots)
++ *   src -> gs  VBLANK virtual vblank on CLOCK_MONOTONIC: the sink's vblank grid
++ *                     minus network time and margin, i.e. "composite done by then"
++ *   gs  -> src READY  slot composited and finished on the GPU (gamescope waited
++ *                     for its own timeline), may be sent now
++ *                     VRR (RDX_GS_FLAG_VRR): no VBLANK at all; gamescope paints when the app presents
++ *                     (at most once per cap period, refresh_mhz) and rdx_gs_src posts each READY at
++ *                     once, but never sooner than one cap period after the previous post (what the
++ *                     kernel does with an early VRR flip); gamescope marks its vblank at that time
++ *   gs  -> src HINT   what the app wants from the client's pointer, sent whenever it changes (slot =
++ *                     RDX_GS_HINT_* bits); rdx_gs_src puts it into the header of every frame it
++ *                     sends to an RDMA sink (RDX_HDR_F_REL_MOUSE). A gamescope without it never sends
++ *                     one: the pointer stays absolute.
++ *   src -> gs  CURSOR the client shows the cursor itself (slot 1: its sink took the cursor channel,
++ *                     common/rdx_cursor.h) or not (slot 0, the start): gamescope draws no cursor into the
++ *                     frames, a pointer that only moves paints nothing (gamescope's nested-backend rule,
++ *                     INestedHints::ShouldPaintCursor), and it reports the cursor instead:
++ *   gs  -> src CURPOS where the hotspot is in output pixels and whether the cursor shows, on every motion
++ *   gs  -> src CURIMG the cursor's picture, in chunks (struct rdx_gs_curimg + pixels), on every change
++ *                     A gamescope without it ignores CURSOR and keeps drawing the cursor.
++ *   either     BYE    end of session
++ * The same header is copied into the gamescope patch (src/Backends/rdx_gs_proto.h).
++ */
++#pragma once
++#include <stdint.h>
++
++#define RDX_GS_MAGIC     0x31534752u    /* "RGS1" */
++#define RDX_GS_MAX_SLOTS 8
++
++#define RDX_GS_BUF_VRAM  0
++#define RDX_GS_BUF_HOST  1
++
++/* hello flags */
++#define RDX_GS_FLAG_TEARING 1u   /* the client shows frames on arrival (rdx_sink_kms --tearing): no vblank
++                                 * pacing, gamescope composites and READYs as soon as the app presents */
++#define RDX_GS_FLAG_DMABUF  2u   /* host buffers handed over as dma-bufs (udmabuf of the memfd slots, same
++                                 * pages): for drivers that cannot import a host pointer of a shared
++                                 * mapping (amdgpu userptr takes anonymous memory only); gamescope
++                                 * imports them with VK_EXT_external_memory_dma_buf */
++#define RDX_GS_FLAG_VRR     4u   /* the client's screen has variable refresh (FreeSync / VRR) and shows each
++                                 * frame when it arrives: gamescope runs at the app's pace (its own adaptive
++                                 * sync logic, the connector reports VRR active), refresh_mhz is the cap
++                                 * (the client's maximum), and rdx_gs_src sends no VBLANK. Never together
++                                 * with RDX_GS_FLAG_TEARING. A gamescope without it ticks on its own timer
++                                 * at refresh_mhz. */
++
++/* HINT: slot = bits */
++#define RDX_GS_HINT_REL_MOUSE 1u /* the app wants relative mouse motion: its cursor is hidden and the pointer is
++                                 * locked (gamescope's own rule for its nested backends, SetRelativeMouseMode);
++                                 * 0 = absolute is fine (desktop apps, visible cursor) */
++
++enum rdx_gs_type {
++    RDX_GS_HELLO  = 1,
++    RDX_GS_ACK    = 2,
++    RDX_GS_FREE   = 3,
++    RDX_GS_VBLANK = 4,
++    RDX_GS_READY  = 5,
++    RDX_GS_BYE    = 6,
++    RDX_GS_RECONFIG = 7,     /* src -> gs: a struct rdx_gs_hello with type RECONFIG + new fds (resume
++                              * at another client mode); gs drops its slots, imports these, ACKs */
++    RDX_GS_HINT   = 8,       /* gs -> src: a struct rdx_gs_msg, slot = RDX_GS_HINT_* bits (see above) */
++    RDX_GS_VRR    = 9,       /* src -> gs: variable refresh on (slot 1) or off (slot 0) from now on, same
++                              * buffers (the client's screen changed it during the session, or a resume at
++                              * the same mode); t_ns = the refresh in mHz gamescope runs at now: the cap with
++                              * VRR, the sink's fixed refresh without. A gamescope without it ignores it. */
++    RDX_GS_CURSOR = 10,      /* src -> gs: a struct rdx_gs_msg, slot 1 = the client shows the cursor (gamescope
++                              * draws none and sends CURPOS / CURIMG, the whole state at once), 0 = draw it */
++    RDX_GS_CURPOS = 11,      /* gs -> src: a struct rdx_gs_msg, slot = RDX_GS_CUR_VISIBLE, pad = the serial of the
++                              * picture, seq = x | (uint64_t)y << 32 (int32 each: the hotspot in output pixels),
++                              * t_ns = when the pointer got there */
++    RDX_GS_CURIMG = 12,      /* gs -> src: a struct rdx_gs_curimg + len bytes of the picture */
++    RDX_GS_INPUT  = 13,      /* src -> gs: a struct rdx_gs_msg, slot 0 = the stream is detached (the app waits in
++                              * the background): let go of every input device (libinput suspended, grabs
++                              * released), so the gamescope of the app in the stream gets the client's devices
++                              * alone; slot 1 = attached again: read them. A gamescope without it ignores it
++                              * (its binary then lacks the marker "RDX_GS_INPUT v1", rdx-hostd allows one app
++                              * in the background only). */
++};
++
++#define RDX_GS_CUR_VISIBLE 1u    /* CURPOS slot: the cursor shows (an image, not hidden) */
++#define RDX_GS_CUR_MAX     256   /* largest picture sent; a bigger one is clipped */
++#define RDX_GS_CUR_CHUNK   16384 /* picture bytes per CURIMG packet */
++
++/* CURIMG: the picture (ARGB8888 premultiplied like an X cursor, rows of w pixels) of serial, bytes
++ * [off, off + len) of w * h * 4; complete with the packet that reaches the end. A new serial (or off 0)
++ * starts it over. */
++struct rdx_gs_curimg {
++    uint32_t magic, type;
++    uint32_t serial;
++    uint16_t w, h, hot_x, hot_y;
++    uint32_t off, len;
++    uint32_t pad;
++    uint64_t t_ns;
++};
++
++struct rdx_gs_hello {
++    uint32_t magic, type;
++    uint32_t width, height, stride;
++    uint32_t drm_fourcc;         /* DRM_FORMAT_XRGB8888 = Vulkan B8G8R8A8 */
++    uint32_t nslots;
++    uint32_t refresh_mhz;        /* sink refresh in mHz (exact, from its vblank period) */
++    uint64_t slot_size;          /* bytes of each VMM allocation (import size) */
++    uint8_t  gpu_uuid[16];       /* the GPU that composites (and, for VRAM, owns the buffers) */
++    uint32_t buf_kind;           /* RDX_GS_BUF_VRAM | RDX_GS_BUF_HOST */
++    uint32_t flags;              /* RDX_GS_FLAG_* */
++};
++
++struct rdx_gs_ack {
++    uint32_t magic, type;
++    uint32_t row_pitch;
++    int32_t  error;              /* 0 = ok, else errno-style */
++    uint32_t path;               /* host buffers: 0 = composite straight into them, 1 = composite
++                                  * into VRAM + one GPU copy into them (driver cannot import a
++                                  * host pointer as an image) */
++    uint32_t pad;
++};
++
++struct rdx_gs_msg {              /* FREE, VBLANK, READY, HINT, BYE */
++    uint32_t magic, type;
++    uint32_t slot, pad;          /* HINT: slot = RDX_GS_HINT_* bits; READY: pad = slot generation (incremented by each RECONFIG) */
++    uint64_t seq;                /* READY: composite counter of gamescope */
++    uint64_t t_ns;               /* VBLANK: virtual vblank; READY: GPU done; VRR: refresh in mHz */
++    uint64_t t_begin_ns;         /* READY: wake-up of the paint that produced it */
++};
+diff --git a/src/Backends/RdxStream.h b/src/Backends/RdxStream.h
+new file mode 100644
+--- /dev/null
++++ b/src/Backends/RdxStream.h
+@@ -0,0 +1,66 @@
++// rdma-display hooks outside the rdx backend (src/Backends/RdxBackend.cpp):
++//  - the Xwayland with explicit sync next to gamescope, for every backend,
++//  - the stream add-on: another backend (DRM on the seat GPU's own monitor port) shows the
++//    picture locally and rdx_gs_src streams the same frames at the client's size,
++//  - the clock rule: the side of the last input leads (monitor or client),
++//  - the cursor next to the picture: the rdx backend's client shows the cursor itself.
++#pragma once
++
++#include <cstdint>
++#include <optional>
++
++#include "rendervulkan.hpp"
++
++namespace gamescope
++{
++	// main(), before wlserver_init: WLR_XWAYLAND = the Xwayland installed next to gamescope
++	void RdxPickXwayland();
++
++	// main(), after the backend is set: with RDX_GS_STREAM_SOCKET (and a backend other than
++	// rdx) wait for rdx_gs_src on that socket path, attach and detach as it comes and goes
++	void RdxStreamInit( bool bRdxBackend );
++
++	// wlserver: every keyboard / pointer / touch event, with its device's name; rdx_input_rx's
++	// mirrors of the client's devices are named "rdx: ..."
++	void RdxNoteInput( const char *pszDevice );
++
++	// Exclusive input (security: the host's console keyboard never sees a stream's keys): every
++	// keyboard / pointer device gamescope reads is grabbed (EVIOCGRAB) on its own fd, so no other
++	// handler of the kernel sees its events, in particular the VT keyboard handler of the host
++	// whose seat containers share its input core. rdx_input_rx / rdx_usb_host hold key events of a
++	// new device back until it is grabbed. RDX_GS_GRAB=0 turns it off (debugging).
++	bool RdxGrabInput();
++	// grab fd (an evdev node) if it is a keyboard or pointer (not a joystick / gamepad: Steam and
++	// the game read those themselves); bClientOnly: only the client's devices (rdx backend: name
++	// or phys "rdx:...", USB/IP), never this host's own or other virtual ones. Retries up to 0.5 s on EBUSY
++	// (the grab checks of rdx_input_rx and rdx-seatmgr hold the device for two ioctls each).
++	void RdxGrabEvdev( int nFd, const char *pszWhat, bool bClientOnly );
++
++	// a stream is attached and the last input came from the client: the client's vblank drives
++	// gamescope, the monitor follows
++	bool RdxClientLeads();
++	// the client's refresh in mHz while it leads (gamescope's vblank timer then ticks at it), else 0
++	int RdxLeadingClientRefresh();
++	const char *RdxClockMode();
++
++	// paint thread, after the monitor's Present: a free stream slot to composite into (nullptr:
++	// no stream or no free slot) and its size; then RdxStreamEnd with the submitted composite
++	gamescope::Rc<CVulkanTexture> RdxStreamBegin( int *pnSlot, uint32_t *puWidth, uint32_t *puHeight );
++
++	// steamcompmgr, every pass: does the app want relative mouse motion (cursor hidden, pointer locked)?
++	// Sent to the stream's rdx_gs_src as RDX_GS_HINT when it changes, for the clients of a backend with
++	// no INestedHints of its own (the DRM backend); a no-op without an attached stream.
++	void RdxStreamSetRelativeMouse( bool bRelative );
++
++	// The cursor next to the picture (the rdx backend, RDX_GS_CURSOR 1: its client shows the cursor itself).
++	// steamcompmgr then draws no cursor and repaints nothing for a pointer that only moves (the nested rule,
++	// ShouldPaintCursor); its hide after inactivity (checkSuspension) runs as in the composited case.
++	bool RdxCursorSeparate();
++	// wlserver_oncursorevent, wlserver lock held: the pointer moved, its position goes to the client at once
++	void RdxCursorMoved();
++	// steamcompmgr's main loop, every pass: before checkSuspension, true = read the X cursor again (setDirty:
++	// a new client gets the picture); after it, RdxCursorTick sends what changed without a motion
++	bool RdxCursorTakeResync();
++	void RdxCursorTick();
++	void RdxStreamEnd( int nSlot, std::optional<uint64_t> oSeq, uint64_t ulBegin );
++}
+diff --git a/src/Backends/DRMBackend.cpp b/src/Backends/DRMBackend.cpp
+--- a/src/Backends/DRMBackend.cpp
++++ b/src/Backends/DRMBackend.cpp
+@@ -34,6 +34,7 @@
+ #include "Utils/Parsers.h"
+ #include "Utils/String.h"
+ #include "drm_include.h"
++#include "Backends/RdxStream.h"
+ #include "edid.h"
+ #include "gamescope_shared.h"
+ #include "gpuvis_trace_utils.h"
+@@ -787,7 +788,9 @@
+ 
+ 	// This is the last vblank time
+ 	uint64_t vblanktime = sec * 1'000'000'000lu + usec * 1'000lu;
+-	GetVBlankTimer().MarkVBlank( vblanktime, true );
++	// rdma-display: while the client leads (last input from it), its vblank drives gamescope
++	if ( !gamescope::RdxClientLeads() )
++		GetVBlankTimer().MarkVBlank( vblanktime, true );
+ 
+ 	// TODO: get the fbids_queued instance from data if we ever have more than one in flight
+ 
+@@ -3923,6 +3926,10 @@
+ 
+ 			bool bNeedsFullComposite = false;
+ 			bNeedsFullComposite |= cv_composite_force;
++			// rdma-display: while the client leads, the app must get its buffers back at the client's
++			// pace; a scanned-out app buffer stays locked until the monitor's next flip replaces it,
++			// which would pace the app at the monitor's refresh again
++			bNeedsFullComposite |= gamescope::RdxClientLeads();
+ 			bNeedsFullComposite |= bWasFirstFrame;
+ 			bNeedsFullComposite |= pFrameInfo->useFSRLayer0;
+ 			bNeedsFullComposite |= pFrameInfo->useNISLayer0;
+@@ -4464,7 +4471,10 @@
+ 			// not when it is successfully queued.
+ 			GetVBlankTimer().UpdateLastDrawTime( get_time_in_nanos() - g_SteamCompMgrVBlankTime.ulWakeupTime );
+ 
+-			if ( isPageFlip )
++			// rdma-display: while the client leads, the monitor follows and must not hold the
++			// compositor at its refresh; the flip completes on its own and paint_all leaves the
++			// monitor out while it is in flight (the stream keeps the client's pace)
++			if ( isPageFlip && !gamescope::RdxClientLeads() )
+ 			{
+ 				// Wait for bPendingFlip to change from true -> false.
+ 				drm->uPendingFlipCount.wait( uNewPendingFlipCount );
+diff --git a/src/backends.h b/src/backends.h
+index 4e017bf..5b99fa6 100644
+--- a/src/backends.h
++++ b/src/backends.h
+@@ -11,6 +11,7 @@ namespace gamescope
+         OpenVR,
+         Headless,
+         Wayland,
++        Rdx,
+     };
+ 
+     // Backend forward declarations.
+@@ -19,4 +20,5 @@ namespace gamescope
+     class COpenVRBackend;
+     class CHeadlessBackend;
+     class CWaylandBackend;
++    class CRdxBackend;
+ }
+diff --git a/src/LibInputHandler.cpp b/src/LibInputHandler.cpp
+--- a/src/LibInputHandler.cpp
++++ b/src/LibInputHandler.cpp
+@@ -4,11 +4,17 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <poll.h>
++#include <cstring>
++#include <libudev.h>
+ 
+ #include "log.hpp"
+ #include "backend.h"
+ #include "wlserver.hpp"
+ #include "Utils/Defer.h"
++#include "Backends/RdxStream.h"
++
++#include <linux/input.h>
++#include <sys/ioctl.h>
+ 
+ // Handles libinput in contexts where we don't have a session
+ // and can't use the wlroots libinput stuff.
+@@ -19,19 +25,32 @@
+ // That may change in the future...
+ // but for now, this solves that problem.
+ 
++// rdma-display (rdx backend): take every virtual input device (uinput / uhid under /devices/virtual:
++// the client's mirrors, a local window's keyboard and mouse, Steam Input, forwarded HID) and USB/IP
++// (vhci_hcd), but not the host's own physical keyboard and mouse (a desktop machine's), which must
++// not reach the app. RDX_GS_INPUT=all takes every device of the seat. The DRM backend does not use
++// this handler (wlroots' libinput backend): a seat's local devices stay unfiltered there.
+ namespace gamescope
+ {
++    bool g_bRdxOnlyRdxDevices = false;
++
+     static LogScope log_input_stealer( "InputStealer" );
+ 
+     const libinput_interface CLibInputHandler::s_LibInputInterface =
+     {
+         .open_restricted = []( const char *pszPath, int nFlags, void *pUserData ) -> int
+         {
+-            return open( pszPath, nFlags );
++            int nFd = open( pszPath, nFlags );
++            // rdma-display: the client's keyboards and pointers exclusively for us (RdxGrabEvdev);
++            // RDX_GS_INPUT=all (every device of the seat) grabs nothing
++            if ( nFd >= 0 && g_bRdxOnlyRdxDevices )
++                RdxGrabEvdev( nFd, pszPath, true );
++            return nFd < 0 ? -errno : nFd;
+         },
+ 
+         .close_restricted = []( int nFd, void *pUserData ) -> void
+         {
++            ioctl( nFd, EVIOCGRAB, 0 );     // gone with the close anyway; EINVAL when not grabbed
+             close( nFd );
+         },
+     };
+@@ -55,7 +74,7 @@
+         }
+     }
+ 
+-    bool CLibInputHandler::Init()
++    bool CLibInputHandler::Init( const char *pszSeatName )
+     {
+         m_pUdev = udev_new();
+         if ( !m_pUdev )
+@@ -71,7 +90,6 @@
+             return false;
+         }
+ 
+-        const char *pszSeatName = "seat0";
+         if ( libinput_udev_assign_seat( m_pLibInput, pszSeatName ) == -1 )
+         {
+             log_input_stealer.errorf( "Could not assign seat \"%s\"", pszSeatName );
+@@ -81,6 +99,18 @@
+         return true;
+     }
+ 
++    void CLibInputHandler::Suspend( bool bSuspend )
++    {
++        if ( !m_pLibInput || m_bSuspended == bSuspend )
++            return;
++        if ( bSuspend )
++            libinput_suspend( m_pLibInput );
++        else if ( libinput_resume( m_pLibInput ) != 0 )
++            log_input_stealer.errorf( "libinput_resume failed: the client's input may not reach the app" );
++        m_bSuspended = bSuspend;
++        OnPollIn();                         // the devices' removal / addition events
++    }
++
+     int CLibInputHandler::GetFD()
+     {
+         if ( !m_pLibInput )
+@@ -99,6 +129,23 @@
+         {
+             defer( libinput_event_destroy( pEvent ) );
+ 
++            if ( g_bRdxOnlyRdxDevices )
++            {
++                libinput_device *pDevice = libinput_event_get_device( pEvent );
++                const char *pszName = pDevice ? libinput_device_get_name( pDevice ) : nullptr;
++                // every VIRTUAL device counts (uinput: rdx_input_rx's mirrors, a local window's keyboard
++                // and mouse, Steam Input's virtual devices; uhid: rdx_usb_host's HID path with the real
++                // device's name) and USB/IP (vhci_hcd); only the host's physical devices are ignored
++                udev_device *pUdev = pDevice ? libinput_device_get_udev_device( pDevice ) : nullptr;
++                const char *pszSys = pUdev ? udev_device_get_syspath( pUdev ) : nullptr;
++                const bool bClient = ( pszName && strncmp( pszName, "rdx:", 4 ) == 0 ) ||
++                                     ( pszSys && ( strstr( pszSys, "/devices/virtual/" ) || strstr( pszSys, "/vhci_hcd" ) ) );
++                if ( pUdev )
++                    udev_device_unref( pUdev );
++                if ( !bClient )
++                    continue;
++            }
++
+             libinput_event_type eEventType = libinput_event_get_type( pEvent );
+ 
+             switch ( eEventType )
+@@ -122,13 +169,15 @@
+                 {
+                     libinput_event_pointer *pPointerEvent = libinput_event_get_pointer_event( pEvent );
+ 
+-                    double flX = libinput_event_pointer_get_absolute_x( pPointerEvent );
+-                    double flY = libinput_event_pointer_get_absolute_y( pPointerEvent );
++                    // 0..1 over the device's range (the raw value is in mm, which only fits a surface of
++                    // exactly the device's size); the client's absolute mouse spans its whole frame
++                    double flX = libinput_event_pointer_get_absolute_x_transformed( pPointerEvent, 1 );
++                    double flY = libinput_event_pointer_get_absolute_y_transformed( pPointerEvent, 1 );
+ 
+                     GetBackend()->NotifyPhysicalInput( InputType::Mouse );
+ 
+                     wlserver_lock();
+-                    wlserver_mousewarp( flX, flY, ++s_uSequence, true );
++                    wlserver_mousewarp_normalized( flX, flY, ++s_uSequence );
+                     wlserver_unlock();
+                 }
+                 break;
+diff --git a/src/LibInputHandler.h b/src/LibInputHandler.h
+--- a/src/LibInputHandler.h
++++ b/src/LibInputHandler.h
+@@ -14,15 +14,22 @@
+         CLibInputHandler();
+         ~CLibInputHandler();
+ 
+-        bool Init();
++        // rdma-display: the udev seat to read (the rdx backend also reads "seat-rdx", the seat of the
++        // devices that are for this gamescope only)
++        bool Init( const char *pszSeatName = "seat0" );
+ 
+         virtual int GetFD() override;
+         virtual void OnPollIn() override;
++
++        // rdma-display: true = close every device (grabs released) and open none until false again
++        // (libinput_suspend / libinput_resume): the rdx backend's app waits in the background
++        void Suspend( bool bSuspend );
+     private:
+         udev *m_pUdev = nullptr;
+         libinput *m_pLibInput = nullptr;
+ 
+         double m_flScrollAccum[2]{};
++        bool m_bSuspended = false;
+ 
+         static const libinput_interface s_LibInputInterface;
+     };
+diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -35,6 +35,7 @@
+ #include "Utils/Version.h"
+ 
+ #include "backends.h"
++#include "Backends/RdxStream.h"
+ #include "refresh_rate.h"
+ 
+ #if HAVE_PIPEWIRE
+@@ -196,6 +197,7 @@
+ #endif
+ 	"                                     headless => use headless backend (no window, no DRM output)\n"
+ 	"                                     wayland => use Wayland backend\n"
++"                                     rdx => composite into rdma-display buffers (RDX_GS_SOCKET, started by rdx_gs_src)\n"
+ 	"  --cursor                       path to default cursor image\n"
+ 	"  -R, --ready-fd                 notify FD when ready\n"
+ 	"  --rt                           Use realtime scheduling\n"
+@@ -436,6 +438,8 @@
+ 		return gamescope::GamescopeBackend::Headless;
+ 	} else if (strcmp(str, "wayland") == 0) {
+ 		return gamescope::GamescopeBackend::Wayland;
++	} else if (strcmp(str, "rdx") == 0) {
++		return gamescope::GamescopeBackend::Rdx;
+ 	} else {
+ 		fprintf( stderr, "gamescope: invalid value for --backend\n" );
+ 		exit(1);
+@@ -974,6 +978,9 @@
+ 
+ 	g_ForcedNV12ColorSpace = parse_colorspace_string( getenv( "GAMESCOPE_NV12_COLORSPACE" ) );
+ 
++	// rdma-display: the Xwayland with explicit sync next to gamescope (NVIDIA), every backend
++	gamescope::RdxPickXwayland();
++
+ 	switch ( eCurrentBackend )
+ 	{
+ #if HAVE_DRM
+@@ -994,6 +1001,9 @@
+ 		case gamescope::GamescopeBackend::Headless:
+ 			gamescope::IBackend::Set<gamescope::CHeadlessBackend>();
+ 			break;
++		case gamescope::GamescopeBackend::Rdx:
++			gamescope::IBackend::Set<gamescope::CRdxBackend>();
++			break;
+ 
+ 		case gamescope::GamescopeBackend::Wayland:
+ 			gamescope::IBackend::Set<gamescope::CWaylandBackend>();
+@@ -1012,6 +1022,9 @@
+ 		return 1;
+ 	}
+ 
++	// rdma-display: stream add-on next to another backend (RDX_GS_STREAM_SOCKET)
++	gamescope::RdxStreamInit( eCurrentBackend == gamescope::GamescopeBackend::Rdx );
++
+ 	UpdateCompatEnvVars();
+ 
+ 	if ( !vulkan_init_formats() )
+@@ -1115,6 +1128,16 @@
+ 
+ 	gamescope::Process::KillAllChildren( getpid(), SIGTERM );
+ 	gamescope::Process::WaitForAllChildren();
++
++	// rdma-display: leave without static destructors and library finalizers. Threads that are
++	// never joined (pipeline compiles, present wait, vblank, PipeWire) still run code of the
++	// Vulkan / EGL driver libraries exit() finalizes and unloads, and the process crashed on every
++	// exit (SIGSEGV in gamescope-wl / gamescope-shdr, a jump to an unloaded address; upstream
++	// #1526, #1808), turning a clean end into signal 11 for whoever waits for gamescope. Everything
++	// that needs an orderly end is shut down or reaped above; the kernel frees the rest.
++	fflush( stdout );
++	fflush( stderr );
++	_exit( 0 );
+ }
+ 
+ static void steamCompMgrThreadRun(int argc, char **argv)
+diff --git a/src/main.hpp b/src/main.hpp
+--- a/src/main.hpp
++++ b/src/main.hpp
+@@ -84,6 +84,9 @@ enum class GamescopeUpscaleScaler : uint32_t
+     FIT,
+     FILL,
+     STRETCH,
++    // rdma-display: fit, but never above 1:1 (a window not larger than the output is shown at its
++    // own size, centred). Only ever chosen by GetUpscaleSettings, not by --scaler or the X property.
++    NOUPSCALE,
+ };
+ 
+ struct UpscaleSettings_t
+@@ -99,11 +102,18 @@ static constexpr UpscaleSettings_t GetUpscaleSettings(
+     bool bFocusIsSteam,
+     GamescopeUpscaleFilter eWantedFilter,
+     GamescopeUpscaleScaler eWantedScaler,
+-    int nWantedSharpness )
++    int nWantedSharpness,
++    bool bFocusIsPlainWindow = false )
+ {
+     if ( bFocusIsSteam )
+         return UpscaleSettings_t{ GamescopeUpscaleFilter::LINEAR, GamescopeUpscaleScaler::FIT, nWantedSharpness };
+ 
++    // rdma-display: the default scaler (auto) stretches a small ordinary window to the output
++    // (a 400x700 login dialog on 2560x1440 comes out blurred and huge); it keeps its own size.
++    // A scaler the user picked (--scaler integer/fit/fill/stretch) is left alone.
++    if ( bFocusIsPlainWindow && eWantedScaler == GamescopeUpscaleScaler::AUTO )
++        return UpscaleSettings_t{ eWantedFilter, GamescopeUpscaleScaler::NOUPSCALE, nWantedSharpness };
++
+     return UpscaleSettings_t{ eWantedFilter, eWantedScaler, nWantedSharpness };
+ }
+ 
+diff --git a/src/meson.build b/src/meson.build
+index ae3ac16..643297c 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -98,6 +98,7 @@ required_wlroots_features = ['xwayland']
+ src = [
+   'Backends/HeadlessBackend.cpp',
+   'Backends/WaylandBackend.cpp',
++  'Backends/RdxBackend.cpp',
+   'Utils/DirHelpers.cpp',
+   'Utils/TempFiles.cpp',
+   'Utils/Version.cpp',
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -5,6 +5,7 @@
+ #include <unistd.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <strings.h>
+ #include <sys/stat.h>
+ #include <algorithm>
+ #include <array>
+@@ -356,6 +357,23 @@
+ 		if (deviceProperties.apiVersion < VK_API_VERSION_1_2)
+ 			continue;
+ 
++		// rdma-display seats: composite on exactly the GPU rdx_gs_src chose. --prefer-vk-device
++		// (vendor:device) cannot tell two identical cards apart; the device UUID can.
++		if ( const char *pszUUID = getenv( "GAMESCOPE_VK_DEVICE_UUID" ); pszUUID && *pszUUID )
++		{
++			VkPhysicalDeviceIDProperties idProps = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
++			VkPhysicalDeviceProperties2 props2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &idProps };
++			vk.GetPhysicalDeviceProperties2( cphysDev, &props2 );
++			char szUUID[ 2 * VK_UUID_SIZE + 1 ] = {};
++			for ( uint32_t i = 0; i < VK_UUID_SIZE; i++ )
++				snprintf( szUUID + 2 * i, 3, "%02x", idProps.deviceUUID[ i ] );
++			if ( strcasecmp( szUUID, pszUUID ) != 0 )
++			{
++				vk_log.infof( "physical device '%s' skipped: not GAMESCOPE_VK_DEVICE_UUID", deviceProperties.deviceName );
++				continue;
++			}
++		}
++
+ 		uint32_t queueFamilyCount = 0;
+ 		vk.GetPhysicalDeviceQueueFamilyProperties(cphysDev, &queueFamilyCount, nullptr);
+ 		std::vector<VkQueueFamilyProperties> queueFamilyProperties(queueFamilyCount);
+@@ -545,18 +563,31 @@
+ 		.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_REALTIME_EXT
+ 	};
+ 
++	// rdma-display seats: a priority per seat, also without CAP_SYS_NICE
++	const char *pszQueuePrio = getenv( "GAMESCOPE_VK_QUEUE_PRIORITY" );
++	const bool bSeatPrio = pszQueuePrio && *pszQueuePrio;
++	if ( bSeatPrio )
++	{
++		queueCreateInfoEXT.globalPriority =
++			!strcmp( pszQueuePrio, "low" ) ? VK_QUEUE_GLOBAL_PRIORITY_LOW_EXT :
++			!strcmp( pszQueuePrio, "high" ) ? VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT :
++			!strcmp( pszQueuePrio, "realtime" ) ? VK_QUEUE_GLOBAL_PRIORITY_REALTIME_EXT : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT;
++		vk_log.infof( "compositor queue priority %s (GAMESCOPE_VK_QUEUE_PRIORITY)", pszQueuePrio );
++	}
++	const bool bUseQueuePrio = bSeatPrio || gamescope::Process::HasCapSysNice();
++
+ 	VkDeviceQueueCreateInfo queueCreateInfos[2] = 
+ 	{
+ 		{
+ 			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+-			.pNext = gamescope::Process::HasCapSysNice() ? &queueCreateInfoEXT : nullptr,
++			.pNext = bUseQueuePrio ? &queueCreateInfoEXT : nullptr,
+ 			.queueFamilyIndex = m_queueFamily,
+ 			.queueCount = 1,
+ 			.pQueuePriorities = &queuePriorities
+ 		},
+ 		{
+ 			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+-			.pNext = gamescope::Process::HasCapSysNice() ? &queueCreateInfoEXT : nullptr,
++			.pNext = bUseQueuePrio ? &queueCreateInfoEXT : nullptr,
+ 			.queueFamilyIndex = m_generalQueueFamily,
+ 			.queueCount = 1,
+ 			.pQueuePriorities = &queuePriorities
+@@ -596,6 +627,11 @@
+ 	for ( auto& extension : GetBackend()->GetDeviceExtensions( physDev() ) )
+ 		enabledExtensions.push_back( extension );
+ 
++	// rdma-display stream add-on next to another backend (RDX_GS_STREAM_SOCKET): its host slots
++	// are imported as host pointers, like the rdx backend's
++	if ( getenv( "RDX_GS_STREAM_SOCKET" ) )
++		enabledExtensions.push_back( VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME );
++
+ 	uint32_t devExtPropCount = 0;
+ 	vk.EnumerateDeviceExtensionProperties( physDev(), nullptr, &devExtPropCount, nullptr );
+ 	std::vector<VkExtensionProperties> devExtProp( devExtPropCount );
+@@ -682,14 +718,14 @@
+ 	};
+ 
+ 	VkResult res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
+-	if ( res == VK_ERROR_NOT_PERMITTED_KHR && gamescope::Process::HasCapSysNice() )
++	if ( res == VK_ERROR_NOT_PERMITTED_KHR && bUseQueuePrio )
+ 	{
+ 		fprintf(stderr, "vkCreateDevice failed with a high-priority queue (general + compute). Falling back to regular priority (general).\n");
+ 		queueCreateInfos[1].pNext = nullptr;
+ 		res = vk.CreateDevice(physDev(), &deviceCreateInfo, nullptr, &m_device);
+ 
+ 
+-		if ( res == VK_ERROR_NOT_PERMITTED_KHR && gamescope::Process::HasCapSysNice() )
++		if ( res == VK_ERROR_NOT_PERMITTED_KHR && bUseQueuePrio )
+ 		{
+ 			fprintf(stderr, "vkCreateDevice failed with a high-priority queue (compute). Falling back to regular priority (all).\n");
+ 			queueCreateInfos[0].pNext = nullptr;
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -112,6 +112,7 @@ static const int g_nBaseCursorScale = 36;
+ 
+ #if HAVE_PIPEWIRE
+ #include "pipewire.hpp"
++#include "Backends/RdxStream.h"
+ #endif
+ 
+ #define STB_IMAGE_IMPLEMENTATION
+@@ -1953,8 +1954,42 @@ window_is_fullscreen( steamcompmgr_win_t *w )
+ 	return w && ( window_is_steam( w ) || w->isFullscreen );
+ }
+ 
++// rdma-display: "no upscaling for ordinary windows" (default on, RDX_GS_NOUPSCALE=0 restores gamescope's
++// auto scaler). gamescope's auto scaler fits every focused window to the output and magnifies it as far
++// as it goes, which is right for a game that renders below the output size but wrong for a desktop-style
++// window (a launcher's login dialog): that comes out blurred and several times its size.
++//
++// The two are told apart by how the app declares itself, not by its size alone: a game that renders below
++// the output is fullscreen (_NET_WM_STATE_FULLSCREEN, Wine and SDL set it for a fullscreen mode, with a
++// mode change too), or has been made as large as the root window (force_windows_fullscreen, Xwayland's
++// resolution emulation: window = root, buffer smaller), or is Steam; those keep the auto scaler and are
++// magnified to the output as before. Everything else that is an X11 toplevel is a plain window and
++// is shown 1:1 in the centre if it is not larger than the output (larger ones are fitted down as before).
++// Native Wayland clients are left as they were (gamescope sizes those itself).
++static bool window_is_plain_window( steamcompmgr_win_t *w )
++{
++	static const bool s_bEnabled = []{ const char *e = getenv( "RDX_GS_NOUPSCALE" ); return !( e && !strcmp( e, "0" ) ); }();
++	if ( !s_bEnabled || !w || w->type != steamcompmgr_win_type_t::XWAYLAND )
++		return false;
++
++	xwayland_ctx_t *ctx = w->xwayland().ctx;
++	if ( !ctx || window_is_fullscreen( w ) || ctx->force_windows_fullscreen )
++		return false;
++
++	// as large as the X root (= the nested size gamescope hands the app): a fullscreen app without the atom
++	return !( w->GetGeometry().nWidth >= ctx->root_width && w->GetGeometry().nHeight >= ctx->root_height );
++}
++
+ void calc_scale_factor_scaler(GamescopeUpscaleScaler eScaler, float &out_scale_x, float &out_scale_y, float sourceWidth, float sourceHeight)
+ {
++	if (eScaler == GamescopeUpscaleScaler::NOUPSCALE)
++	{
++		// fit to the output (both axes), at most 1:1; the centring follows from the scale in the callers
++		const float flFit = std::min(currentOutputWidth / sourceWidth, currentOutputHeight / sourceHeight);
++		out_scale_x = out_scale_y = std::min(1.0f, flFit);
++		return;
++	}
++
+ 	float XOutputRatio = currentOutputWidth / (float)g_nNestedWidth;
+ 	float YOutputRatio = currentOutputHeight / (float)g_nNestedHeight;
+ 	float outputScaleRatio = std::min(XOutputRatio, YOutputRatio);
+@@ -2044,7 +2079,8 @@ void MouseCursor::checkSuspension()
+ {
+ 	getTexture();
+ 
+-	if ( ShouldDrawCursor() )
++	// rdma-display: a cursor the client shows itself hides after inactivity like a drawn one
++	if ( ShouldDrawCursor() || gamescope::RdxCursorSeparate() )
+ 	{
+ 		const bool suspended = int64_t( get_time_in_nanos() ) - int64_t( wlserver.ulLastMovedCursorTime ) > int64_t( cursorHideTime );
+ 		if (!wlserver.bCursorHidden && suspended) {
+@@ -2067,7 +2103,9 @@ void MouseCursor::checkSuspension()
+ 
+ 			// We're hiding the cursor, force redraw if we were showing it
+ 			if (window && !m_imageEmpty ) {
+-				hasRepaintNonBasePlane = true;
++				// rdma-display: not drawn, nothing to repaint (RdxCursorTick tells the client)
++				if ( !gamescope::RdxCursorSeparate() )
++					hasRepaintNonBasePlane = true;
+ 				nudge_steamcompmgr();
+ 			}
+ 		}
+@@ -2200,7 +2238,9 @@ bool MouseCursor::getTexture()
+ 
+ 	// Not GetCurrentMouseFocus(), its keyboard focus fallback may show another Xwayland.
+ 	gamescope::IBackendConnector *pMouseConnector = GetBackend()->GetCurrentMouseConnector();
+-	const bool bNested = pMouseConnector && pMouseConnector->GetNestedHints();
++	// rdma-display: the rdx connector has hints (the relative mouse mode) but composites its own cursor
++	const bool bNested = pMouseConnector && pMouseConnector->GetNestedHints() &&
++		!pMouseConnector->GetNestedHints()->ShouldPaintCursor();
+ 	global_focus_t *pNestedFocus = nullptr;
+ 	if ( bNested )
+ 	{
+@@ -2428,7 +2468,9 @@ void MouseCursor::paint(steamcompmgr_win_t *window, steamcompmgr_win_t *fit, str
+ 		scaledY += ((sourceHeight / 2) - winY) * currentScaleRatio_y;
+ 	}
+ 
+-	bool bNested = GetBackend()->GetCurrentMouseConnector() && GetBackend()->GetCurrentMouseConnector()->GetNestedHints();
++	// rdma-display: the rdx connector has hints (the relative mouse mode) but composites its own cursor
++	bool bNested = GetBackend()->GetCurrentMouseConnector() && GetBackend()->GetCurrentMouseConnector()->GetNestedHints() &&
++		!GetBackend()->GetCurrentMouseConnector()->GetNestedHints()->ShouldPaintCursor();
+ 	if ( !bNested )
+ 	{
+ 		// Apply the cursor offset inside the texture using the display scale
+@@ -2892,7 +2934,8 @@ static void paint_pipewire()
+ 		GetCurrentFocus() && window_is_steam( GetCurrentFocus()->focusWindow ),
+ 		g_wantedUpscaleFilter,
+ 		g_wantedUpscaleScaler,
+-		g_upscaleFilterSharpness );
++		g_upscaleFilterSharpness,
++		GetCurrentFocus() && window_is_plain_window( GetCurrentFocus()->focusWindow ) );
+ 	frameInfo.eUpscaleFilter = upscaleSettings.eFilter;
+ 	frameInfo.eUpscaleScaler = upscaleSettings.eScaler;
+ 	frameInfo.nUpscaleSharpness = upscaleSettings.nSharpness;
+@@ -3042,6 +3085,54 @@ static void paint_pipewire()
+ }
+ #endif
+ 
++// rdma-display stream add-on (src/Backends/RdxStream.h): the frame the monitor just got, once
++// more at the client's size into a stream slot. Same layers (overlay, notifications, cursor
++// included), each layer's transform scaled by client size / output size (the composite samples
++// a layer at (pixel + offset) * scale); SDR gamma 2.2 with the screenshot colour management like
++// the PipeWire stream, so an HDR monitor still streams SDR. Blit shader, no upscaler pass.
++static void rdx_stream_paint( const struct FrameInfo_t *pMonitorFrame )
++{
++	int nSlot = -1;
++	uint32_t uWidth = 0, uHeight = 0;
++	gamescope::Rc<CVulkanTexture> pTarget = gamescope::RdxStreamBegin( &nSlot, &uWidth, &uHeight );
++	if ( !pTarget || !currentOutputWidth || !currentOutputHeight )
++		return;
++
++	const uint64_t ulBegin = get_time_in_nanos();
++	struct FrameInfo_t frameInfo = *pMonitorFrame;
++	const float flScaleX = (float)uWidth / (float)currentOutputWidth;
++	const float flScaleY = (float)uHeight / (float)currentOutputHeight;
++	for ( int i = 0; i < frameInfo.layers.count(); i++ )
++	{
++		FrameInfo_t::Layer_t &layer = frameInfo.layers.get( i );
++		layer.offset.x *= flScaleX;
++		layer.offset.y *= flScaleY;
++		layer.scale.x /= flScaleX;
++		layer.scale.y /= flScaleY;
++	}
++	frameInfo.useFSRLayer0 = false;
++	frameInfo.useNISLayer0 = false;
++	frameInfo.useSGSRLayer0 = false;
++	frameInfo.blurLayer0 = BLUR_MODE_OFF;
++	frameInfo.applyOutputColorMgmt = true;
++	frameInfo.outputEncodingEOTF = EOTF_Gamma22;
++	for ( uint32_t nInputEOTF = 0; nInputEOTF < EOTF_Count; nInputEOTF++ )
++	{
++		frameInfo.lut3D[nInputEOTF] = g_ScreenshotColorMgmtLuts[nInputEOTF].vk_lut3d;
++		frameInfo.shaperLut[nInputEOTF] = g_ScreenshotColorMgmtLuts[nInputEOTF].vk_lut1d;
++	}
++
++	const uint32_t uBackupWidth = currentOutputWidth;
++	const uint32_t uBackupHeight = currentOutputHeight;
++	currentOutputWidth = uWidth;
++	currentOutputHeight = uHeight;
++	std::optional<uint64_t> oSeq = vulkan_screenshot( &frameInfo, pTarget, nullptr );
++	currentOutputWidth = uBackupWidth;
++	currentOutputHeight = uBackupHeight;
++
++	gamescope::RdxStreamEnd( nSlot, oSeq, ulBegin );
++}
++
+ gamescope::ConVar<int> cv_cursor_composite{ "cursor_composite", 1, "0 = Never composite a cursor. 1 = Composite cursor when not nested. 2 = Always composite a cursor manually" };
+ bool ShouldDrawCursor()
+ {
+@@ -3501,11 +3592,18 @@ paint_all( global_focus_t *pFocus, bool async )
+ 		}
+ 	}
+ 
+-	if ( pConnector && pConnector->Present( &frameInfo, async ) != 0 )
++	// rdma-display: while the client leads, the monitor follows; a flip still in flight means
++	// this frame goes to the stream only (the monitor shows the next one)
++	const bool bRdxSkipMonitor = gamescope::RdxClientLeads() && pConnector &&
++		pConnector->PresentationFeedback().CurrentPresentsInFlight() != 0;
++
++	if ( !bRdxSkipMonitor && pConnector && pConnector->Present( &frameInfo, async ) != 0 )
+ 	{
+ 		return;
+ 	}
+ 
++	rdx_stream_paint( &frameInfo );
++
+ 	std::optional<gamescope::GamescopeScreenshotInfo> oScreenshotInfo =
+ 		gamescope::CScreenshotManager::Get().ProcessPendingScreenshot();
+ 
+@@ -9359,6 +9457,26 @@ static LogScope s_LaunchLogScope( "launch" );
+ 
+ static std::vector<uint32_t> s_uRelativeMouseFilteredAppids;
+ 
++// Does the app in this focus want relative mouse motion: its cursor is hidden, the pointer is locked and it is
++// not Steam or an excluded app. gamescope's rule for its nested backends (INestedHints::SetRelativeMouseMode);
++// rdma-display also uses it for the stream add-on (RdxStreamSetRelativeMouse).
++static bool steamcompmgr_wants_relative_mouse( global_focus_t *pFocus )
++{
++	const bool bImageEmpty =
++		( pFocus->cursor && pFocus->cursor->imageEmpty() ) &&
++		( !window_is_steam( pFocus->inputFocusWindow ) );
++
++	const bool bHasPointerConstraint = pFocus->cursor && pFocus->cursor->IsConstrained();
++
++	uint32_t uAppId = pFocus->inputFocusWindow
++		? pFocus->inputFocusWindow->appID
++		: 0;
++
++	const bool bExcludedAppId = uAppId && gamescope::Algorithm::Contains( s_uRelativeMouseFilteredAppids, uAppId );
++
++	return bImageEmpty && bHasPointerConstraint && !bExcludedAppId;
++}
++
+ // Games that hide the cursor and constrain the pointer like a relative mouse
+ // game, but still want absolute mouse input.
+ static constexpr uint32_t k_uRelativeMouseFilterDefaultAppids[] =
+@@ -10527,7 +10645,8 @@ steamcompmgr_main(int argc, char **argv)
+ 				window_is_steam( pPaintFocus->focusWindow ),
+ 				g_wantedUpscaleFilter,
+ 				g_wantedUpscaleScaler,
+-				g_upscaleFilterSharpness );
++				g_upscaleFilterSharpness,
++				window_is_plain_window( pPaintFocus->focusWindow ) );
+ 			pPaintFocus->eUpscaleFilter = upscaleSettings.eFilter;
+ 			pPaintFocus->eUpscaleScaler = upscaleSettings.eScaler;
+ 			pPaintFocus->nUpscaleSharpness = upscaleSettings.nSharpness;
+@@ -10540,21 +10659,12 @@ steamcompmgr_main(int argc, char **argv)
+ 
+ 			if ( pPaintFocus->GetNestedHints() && !g_bForceRelativeMouse )
+ 			{
+-				const bool bImageEmpty =
+-					( pPaintFocus->cursor && pPaintFocus->cursor->imageEmpty() ) &&
+-					( !window_is_steam( pPaintFocus->inputFocusWindow ) );
+-
+-				const bool bHasPointerConstraint = pPaintFocus->cursor && pPaintFocus->cursor->IsConstrained();
+-
+-				uint32_t uAppId = pPaintFocus->inputFocusWindow
+-					? pPaintFocus->inputFocusWindow->appID
+-					: 0;
+-
+-				const bool bExcludedAppId = uAppId && gamescope::Algorithm::Contains( s_uRelativeMouseFilteredAppids, uAppId );
+-
+-				const bool bRelativeMouseMode = bImageEmpty && bHasPointerConstraint && !bExcludedAppId;
+-
+-				pPaintFocus->GetNestedHints()->SetRelativeMouseMode( bRelativeMouseMode );
++				pPaintFocus->GetNestedHints()->SetRelativeMouseMode( steamcompmgr_wants_relative_mouse( pPaintFocus ) );
++			}
++			else if ( !pPaintFocus->GetNestedHints() )
++			{
++				// rdma-display: the stream add-on of a backend without hints (DRM on the seat's monitor)
++				gamescope::RdxStreamSetRelativeMouse( steamcompmgr_wants_relative_mouse( pPaintFocus ) );
+ 			}
+ 
+ 			// HACK: Disable tearing if we have an overlay to avoid stutters right now
+@@ -10724,8 +10834,14 @@ steamcompmgr_main(int argc, char **argv)
+ 
+ 		if (GetCurrentFocus() && GetCurrentFocus()->cursor)
+ 		{
++			// rdma-display: a new client of the cursor next to the picture gets the whole picture
++			if ( gamescope::RdxCursorTakeResync() )
++				GetCurrentFocus()->cursor->setDirty();
++
+ 			GetCurrentFocus()->cursor->checkSuspension();
+ 
++			gamescope::RdxCursorTick();
++
+ 			if (GetCurrentFocus()->cursor->needs_server_flush())
+ 			{
+ 				flush_root = true;
+diff --git a/src/vblankmanager.cpp b/src/vblankmanager.cpp
+--- a/src/vblankmanager.cpp
++++ b/src/vblankmanager.cpp
+@@ -18,6 +18,7 @@
+ #include "steamcompmgr.hpp"
+ #include "main.hpp"
+ #include "refresh_rate.h"
++#include "Backends/RdxStream.h"
+ 
+ LogScope g_VBlankLog("vblank");
+ 
+@@ -74,6 +75,11 @@
+ 
+ 	int CVBlankTimer::GetRefresh() const
+ 	{
++		// rdma-display: while the client of a stream leads the clock (last input from it), gamescope
++		// ticks at the client's refresh (its VBLANKs mark the phase); the monitor shows the newest
++		// frame at its own flips
++		if ( int nClient = RdxLeadingClientRefresh() )
++			return nClient;
+ 		return g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
+ 	}
+ 
+diff --git a/src/wlserver.cpp b/src/wlserver.cpp
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -28,6 +28,9 @@
+ #include <wlr/backend/headless.h>
+ #if HAVE_DRM
+ #include <wlr/backend/libinput.h>
++#include <wlr/backend/session.h>
++#include <libinput.h>
++#include <libudev.h>
+ #endif
+ #include <wlr/backend/multi.h>
+ #include <wlr/interfaces/wlr_keyboard.h>
+@@ -57,6 +60,7 @@
+ #include "presentation-time-protocol.h"
+ 
+ #include "wlserver.hpp"
++#include "Backends/RdxStream.h"
+ #include "hdmi.h"
+ #include "main.hpp"
+ #include "steamcompmgr.hpp"
+@@ -347,12 +351,28 @@ static void wlserver_perform_rel_pointer
+ static void wlserver_handle_pointer_motion(struct wl_listener *listener, void *data)
+ {
+ 	struct wlr_pointer_motion_event *event = (struct wlr_pointer_motion_event *) data;
++	struct wlserver_pointer *pointer = wl_container_of( listener, pointer, motion );
++	gamescope::RdxNoteInput( pointer->wlr->base.name );
+ 
+ 	wlserver.physical_cursor_move = true;
+ 
+ 	wlserver_mousemotion(event->unaccel_dx, event->unaccel_dy, event->time_msec);
+ }
+ 
++// rdma-display: an absolute pointer (a tablet-like device, e.g. the "window pointer" of a client that
++// shows the stream in a window) through wlroots' libinput backend (DRM backend, a seat's own monitor):
++// the position over the output, normalised 0..1, mapped like touch input (wlserver_mousewarp_normalized)
++static void wlserver_handle_pointer_motion_absolute(struct wl_listener *listener, void *data)
++{
++	struct wlr_pointer_motion_absolute_event *event = (struct wlr_pointer_motion_absolute_event *) data;
++	struct wlserver_pointer *pointer = wl_container_of( listener, pointer, motion_absolute );
++	gamescope::RdxNoteInput( pointer->wlr->base.name );
++
++	wlserver.physical_cursor_move = true;
++
++	wlserver_mousewarp_normalized( event->x, event->y, event->time_msec );
++}
++
+ void wlserver_open_steam_menu( bool qam )
+ {
+ 	gamescope_xwayland_server_t *server = wlserver_get_xwayland_server( 0 );
+@@ -375,6 +395,7 @@ static void wlserver_handle_pointer_butt
+ {
+ 	struct wlserver_pointer *pointer = wl_container_of( listener, pointer, button );
+ 	struct wlr_pointer_button_event *event = (struct wlr_pointer_button_event *) data;
++	gamescope::RdxNoteInput( pointer->wlr->base.name );
+ 
+ 	wlr_seat_pointer_notify_button( wlserver.wlr.seat, event->time_msec, event->button, event->state );
+ 	wlserver_drag_anchor_release();
+@@ -453,6 +474,7 @@ static void wlserver_handle_touch_down(s
+ {
+ 	struct wlserver_touch *touch = wl_container_of( listener, touch, down );
+ 	struct wlr_touch_down_event *event = (struct wlr_touch_down_event *) data;
++	gamescope::RdxNoteInput( touch->wlr->base.name );
+ 
+ 	wlserver_touch_associate_connector( touch );
+ 	wlserver_touchdown( event->x, event->y, event->touch_id, event->time_msec, touch->connector );
+@@ -479,8 +501,15 @@ struct wlserver_keyboard {
+ 	struct wlr_keyboard *wlr;
+ 
+ 	struct wl_listener destroy;
++	struct wl_listener rdx_key;	// rdma-display: which side typed last (the group hides the device)
+ };
+ 
++static void wlserver_handle_keyboard_rdx_key(struct wl_listener *listener, void *data)
++{
++	struct wlserver_keyboard *keyboard = wl_container_of( listener, keyboard, rdx_key );
++	gamescope::RdxNoteInput( keyboard->wlr->base.name );
++}
++
+ // The keyboards in wlserver.keyboard_group, kept so a layout change can reach them.
+ // wlroots keeps keyboard_group_device private, so we cannot iterate group->devices.
+ static std::vector<struct wlserver_keyboard *> s_Keyboards;
+@@ -491,6 +520,7 @@ static void wlserver_handle_keyboard_des
+ 
+ 	std::erase( s_Keyboards, keyboard );
+ 	wl_list_remove( &keyboard->destroy.link );
++	wl_list_remove( &keyboard->rdx_key.link );
+ 	free( keyboard );
+ }
+ 
+@@ -499,6 +529,7 @@ static void wlserver_handle_pointer_dest
+ 	struct wlserver_pointer *pointer = wl_container_of( listener, pointer, destroy );
+ 
+ 	wl_list_remove( &pointer->motion.link );
++	wl_list_remove( &pointer->motion_absolute.link );
+ 	wl_list_remove( &pointer->button.link );
+ 	wl_list_remove( &pointer->axis.link );
+ 	wl_list_remove( &pointer->frame.link );
+@@ -517,9 +548,31 @@ static void wlserver_handle_touch_destro
+ 	free( touch );
+ }
+ 
++// rdma-display: a libinput keyboard / pointer of wlroots' session (the DRM backend of a seat's own
++// monitor) exclusively for us: grab the fd the session opened for it (RdxGrabEvdev)
++static void rdx_grab_session_device( struct wlr_input_device *device )
++{
++	if ( !wlserver.wlr.session || !wlr_input_device_is_libinput( device ) || !gamescope::RdxGrabInput() )
++		return;
++	struct libinput_device *pLibInput = wlr_libinput_get_device_handle( device );
++	struct udev_device *pUdev = pLibInput ? libinput_device_get_udev_device( pLibInput ) : nullptr;
++	if ( !pUdev )
++		return;
++	const dev_t devnum = udev_device_get_devnum( pUdev );
++	udev_device_unref( pUdev );
++	struct wlr_device *pDev;
++	wl_list_for_each( pDev, &wlserver.wlr.session->devices, link )
++	{
++		if ( pDev->dev == devnum )
++			gamescope::RdxGrabEvdev( pDev->fd, device->name, false );   // a 2nd capability: EBUSY, own grab
++	}
++}
++
+ static void wlserver_new_input(struct wl_listener *listener, void *data)
+ {
+ 	struct wlr_input_device *device = (struct wlr_input_device *) data;
++	if ( device->type == WLR_INPUT_DEVICE_KEYBOARD || device->type == WLR_INPUT_DEVICE_POINTER )
++		rdx_grab_session_device( device );
+ 
+ 	switch ( device->type )
+ 	{
+@@ -536,6 +589,8 @@ static void wlserver_new_input(struct wl
+ 			pKeyboard->wlr = keyboard;
+ 			pKeyboard->destroy.notify = wlserver_handle_keyboard_destroy;
+ 			wl_signal_add( &device->events.destroy, &pKeyboard->destroy );
++			pKeyboard->rdx_key.notify = wlserver_handle_keyboard_rdx_key;
++			wl_signal_add( &keyboard->events.key, &pKeyboard->rdx_key );
+ 			s_Keyboards.push_back( pKeyboard );
+ 			// Sync the state of the modifiers and the state of the LEDs
+ 			struct wlr_keyboard_modifiers mods = wlserver.keyboard_group->keyboard.modifiers;
+@@ -556,6 +611,8 @@ static void wlserver_new_input(struct wl
+ 
+ 			pointer->motion.notify = wlserver_handle_pointer_motion;
+ 			wl_signal_add( &pointer->wlr->events.motion, &pointer->motion );
++			pointer->motion_absolute.notify = wlserver_handle_pointer_motion_absolute;
++			wl_signal_add( &pointer->wlr->events.motion_absolute, &pointer->motion_absolute );
+ 			pointer->button.notify = wlserver_handle_pointer_button;
+ 			wl_signal_add( &pointer->wlr->events.button, &pointer->button );
+ 			pointer->axis.notify = wlserver_handle_pointer_axis;
+@@ -2690,6 +2747,9 @@ std::pair<int, int> wlserver_get_surface
+ bool ShouldDrawCursor();
+ void wlserver_oncursorevent()
+ {
++	// rdma-display: the rdx backend's client shows the cursor itself, the position goes there now
++	gamescope::RdxCursorMoved();
++
+ 	// Don't repaint if we would use a nested cursor.
+ 	if ( !ShouldDrawCursor() )
+ 		return;
+@@ -3111,6 +3171,48 @@ void wlserver_mousewarp( double x, doubl
+ 	wlr_seat_pointer_notify_frame( wlserver.wlr.seat );
+ }
+ 
++// rdma-display: an absolute pointer (libinput, the client's uinput tablet-style mouse) as a position 0..1
++// over the whole output, mapped like a touch: output pixels, then the focused window's offset and scale,
++// clamped to the surface. wlserver_mousewarp( raw device mm ) is only right if the device range happens
++// to equal the focused surface.
++void wlserver_mousewarp_normalized( double flNormX, double flNormY, uint32_t time )
++{
++	assert( wlserver_is_lock_held() );
++
++	if ( wlserver.mouse_focus_surface == NULL )
++		return;
++
++	double tx = flNormX * g_nOutputWidth;
++	double ty = flNormY * g_nOutputHeight;
++	tx += focusedWindowOffsetX;
++	ty += focusedWindowOffsetY;
++	tx *= focusedWindowScaleX;
++	ty *= focusedWindowScaleY;
++
++	auto [nWidth, nHeight] = wlserver_get_cursor_bounds();
++	tx = clamp( tx, 0.0, nWidth - 0.1 );
++	ty = clamp( ty, 0.0, nHeight - 0.1 );
++
++	wlserver_mousewarp( tx, ty, time, false );   /* a real device moved: the cursor shows again */
++}
++
++// rdma-display (the cursor next to the picture): where the hotspot is on the focused surface, like
++// MouseCursor::UpdatePosition (a constraint's cursor hint wins), and whether the cursor shows; lock held
++void wlserver_cursor_state( double *pX, double *pY, bool *pVisible )
++{
++	assert( wlserver_is_lock_held() );
++
++	*pX = wlserver.mouse_surface_cursorx;
++	*pY = wlserver.mouse_surface_cursory;
++	struct wlr_pointer_constraint_v1 *pConstraint = wlserver.GetCursorConstraint();
++	if ( pConstraint && pConstraint->current.cursor_hint.enabled )
++	{
++		*pX = pConstraint->current.cursor_hint.x;
++		*pY = pConstraint->current.cursor_hint.y;
++	}
++	*pVisible = !wlserver.bCursorHidden && wlserver.bCursorHasImage;
++}
++
+ void wlserver_fake_mouse_pos( double x, double y )
+ {
+ 	// Fake a pos for eg. hiding true cursor state from Steam.
+diff --git a/src/wlserver.hpp b/src/wlserver.hpp
+--- a/src/wlserver.hpp
++++ b/src/wlserver.hpp
+@@ -231,6 +231,7 @@ struct wlserver_pointer {
+ 	struct wlr_pointer *wlr;
+ 	
+ 	struct wl_listener motion;
++	struct wl_listener motion_absolute;
+ 	struct wl_listener button;
+ 	struct wl_listener axis;
+ 	struct wl_listener frame;
+@@ -272,6 +273,8 @@ void wlserver_notify_dropdown( struct wl
+ void wlserver_mousemotion( double x, double y, uint32_t time );
+ void wlserver_mousehide();
+ void wlserver_mousewarp( double x, double y, uint32_t time, bool bSynthetic );
++void wlserver_mousewarp_normalized( double flNormX, double flNormY, uint32_t time );
++void wlserver_cursor_state( double *pX, double *pY, bool *pVisible );
+ void wlserver_mousebutton( int button, bool press, uint32_t time );
+ void wlserver_mousewheel( double x, double y, uint32_t time );
+ bool wlserver_input_held();

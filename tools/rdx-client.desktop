@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=rdma-display
+Comment=Stream a remote screen over RDMA (rdx-clientd web UI)
+Exec=xdg-open http://127.0.0.1:47991/
+Icon=video-display
+Terminal=false
+Categories=Network;RemoteAccess;

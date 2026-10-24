@@ -1,0 +1,23 @@
+# rdma-display host daemon, one more seat (instance N: ports +100*N, /etc/rdx/hostd-seatN.json).
+# Installed by "desktop/install.sh host --seat N"; started and stopped by that seat's
+# "RDMA Display Host (seat N)" tray app (polkit rule 50-rdma-display.rules); install.sh also enables it, so it is up after a reboot.
+# The seat's GPU and name are in its config ("gpu": "0000:0d:00.0", "seat_name").
+[Unit]
+Description=rdma-display host daemon, seat %i (rdx-hostd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# the link address is the seat's own ("link_ip" in its config: with a macvlan of the RoCE port per
+# seat container every seat has its own address)
+ExecStart=/opt/rdma-display/host/rdx_hostd --repo /opt/rdma-display --seat %i
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=10
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

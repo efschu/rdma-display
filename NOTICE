@@ -1,0 +1,28 @@
+rdma-display
+Copyright (c) 2026 efschu
+
+rdma-display is licensed under the MIT License (LICENSE), with the exceptions below.
+
+Third-party code (third_party/, each with its own license file):
+
+  third_party/civetweb     CivetWeb embedded web server            MIT (LICENSE.md)
+  third_party/cjson        cJSON                                    MIT (LICENSE)
+  third_party/stb          stb_image, stb_image_write, stb_truetype MIT or public domain (LICENSE)
+  third_party/afmf-linux   afmf-linux frame generation core, incl.  MIT (LICENSE; AMD FidelityFX
+                           AMD FidelityFX Optical Flow shaders      shaders: their LICENSE.txt)
+  third_party/xclip        xclip's selection library (xclib)        GPL-2.0-or-later (COPYING)
+
+GPL parts:
+
+  clip/rdx_clip.c links third_party/xclip and is GPL-2.0-or-later (its SPDX header); the binary
+  clip/rdx_clip is therefore distributed under GPL-2.0-or-later. Its protocol part
+  clip/rdx_clip_proto.{c,h} and everything else in this repository stay MIT.
+
+gamescope:
+
+  gs/gamescope-rdx.patch is a patch to gamescope (https://github.com/ValveSoftware/gamescope,
+  BSD-2-Clause). The patch is provided under gamescope's BSD-2-Clause license. gs/build_gamescope.sh
+  downloads gamescope with its submodules (wlroots, libliftoff, vkroots, ...), Xwayland with
+  xorgproto, and - where the system's are too old - wayland, libdrm, wayland-protocols,
+  libxkbcommon and pixman from their upstream repositories at build time; they keep their own
+  licenses. Nothing of them is part of this repository.

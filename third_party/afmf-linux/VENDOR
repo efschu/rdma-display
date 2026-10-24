@@ -1,0 +1,8 @@
+afmf-linux, frame generation core only (FidelityFX Optical Flow + interpolation shader)
+Source:   https://github.com/serialexperimentslainnnn/afmf-linux
+Commit:   bc56e5bd0e3a6c328aedef664d0d36363fb58b36 (2026-09-22, release 1.3.1)
+License:  MIT (LICENSE); shaders/fidelityfx: AMD FidelityFX SDK, MIT (shaders/fidelityfx/LICENSE.txt, NOTICE.md)
+Taken:    src/config.*, log.*, layer.h (struct afmf_device), framegen*.{c,h}, shaders/ (unchanged)
+Left out: the Vulkan layer itself (layer_*.c, swapchain_*.c), tests, docs
+Added:    src/framegen_host.{c,h} (rdma-display: frames from/to VkBuffers in host memory)
+Used by:  gs/rdx_fg.c (frame generation on a helper GPU), see docs/MULTI-GPU.md

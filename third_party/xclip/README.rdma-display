@@ -1,0 +1,7 @@
+xclib.c, xclib.h: the selection library of xclip (https://github.com/astrand/xclip, master
+2c3b811002b35d3be7f39cc1145dd06bdb32e31c, 2025-01-09), unchanged, GPL-2.0-or-later (COPYING).
+xcout() reads a selection (INCR included), xcin() serves one (INCR for large texts, TARGETS).
+xcdef.h and xcprint.h are small stand-ins for the xclip program's headers of the same name.
+
+Used by clip/rdx_clip (the clipboard helper), which is therefore GPL-2.0-or-later as a binary;
+the rest of rdma-display stays MIT.

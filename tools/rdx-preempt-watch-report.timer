@@ -1,0 +1,9 @@
+[Unit]
+Description=rdma-display: daily preemption mode comparison (yesterday, UTC)
+
+[Timer]
+OnCalendar=*-*-* 00:15:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

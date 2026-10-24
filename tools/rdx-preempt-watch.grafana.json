@@ -1,0 +1,612 @@
+{
+ "uid": "rdx-preempt-watch",
+ "title": "Preemption mode – benefit and cost",
+ "schemaVersion": 39,
+ "time": {
+  "from": "now-24h",
+  "to": "now"
+ },
+ "refresh": "1m",
+ "tags": [
+  "rdma-display",
+  "kernel"
+ ],
+ "panels": [
+  {
+   "type": "state-timeline",
+   "title": "Preemption mode",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 3
+   },
+   "fieldConfig": {
+    "defaults": {
+     "mappings": [
+      {
+       "type": "value",
+       "options": {
+        "0": {
+         "text": "none",
+         "color": "purple"
+        },
+        "1": {
+         "text": "voluntary",
+         "color": "orange"
+        },
+        "2": {
+         "text": "full",
+         "color": "green"
+        },
+        "3": {
+         "text": "lazy",
+         "color": "blue"
+        }
+       }
+      }
+     ]
+    },
+    "overrides": []
+   },
+   "options": {
+    "showValue": "auto",
+    "legend": {
+     "showLegend": true
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "max without (mode) (rdx_preempt_mode_code)",
+     "legendFormat": "mode",
+     "refId": "A",
+     "interval": "1m"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Wake-up latency, SCHED_FIFO 80 (cyclictest, 1 ms, per minute)",
+   "description": "Benefit: how late a real-time thread wakes. Alarm above 4 ms.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 3,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "max without (mode) (rdx_preempt_wake_rt_max_us) / 1000",
+     "legendFormat": "max",
+     "refId": "A",
+     "interval": "1m"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "max without (mode) (rdx_preempt_wake_rt_p99_us) / 1000",
+     "legendFormat": "p99",
+     "refId": "B",
+     "interval": "1m"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Wake-up latency, SCHED_OTHER (cyclictest, 1 ms, per minute)",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 3,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "max without (mode) (rdx_preempt_wake_other_max_us) / 1000",
+     "legendFormat": "max",
+     "refId": "A",
+     "interval": "1m"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "max without (mode) (rdx_preempt_wake_other_p99_us) / 1000",
+     "legendFormat": "p99",
+     "refId": "B",
+     "interval": "1m"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "PipeWire xruns per minute (seat containers, driver nodes)",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 11,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 60,
+      "spanNulls": false,
+      "drawStyle": "bars"
+     },
+     "min": 0,
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "rdx_preempt_seat_pw_xruns",
+     "legendFormat": "CT {{ct}}",
+     "refId": "A",
+     "interval": "1m"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Audio underruns per minute (hostd in the seats, clients)",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 11,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 60,
+      "spanNulls": false,
+      "drawStyle": "bars"
+     },
+     "min": 0,
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "rdx_preempt_seat_hostd_underruns",
+     "legendFormat": "hostd CT {{ct}}",
+     "refId": "A",
+     "interval": "1m"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "rdx_preempt_client_audio_underruns",
+     "legendFormat": "client {{client}}",
+     "refId": "B",
+     "interval": "1m"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Host CPU % (node_exporter, also before the watcher)",
+   "description": "Cost. History from node_exporter, so voluntary periods are visible too.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 19,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "sum(rate(node_cpu_seconds_total{instance=\"$instance\",mode=\"system\"}[2m])) / sum(rate(node_cpu_seconds_total{instance=\"$instance\"}[2m])) * 100",
+     "legendFormat": "sys",
+     "refId": "A",
+     "interval": "1m"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "sum(rate(node_cpu_seconds_total{instance=\"$instance\",mode=\"softirq\"}[2m])) / sum(rate(node_cpu_seconds_total{instance=\"$instance\"}[2m])) * 100",
+     "legendFormat": "softirq",
+     "refId": "B",
+     "interval": "1m"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "sum(rate(node_cpu_seconds_total{instance=\"$instance\",mode=\"irq\"}[2m])) / sum(rate(node_cpu_seconds_total{instance=\"$instance\"}[2m])) * 100",
+     "legendFormat": "irq",
+     "refId": "C",
+     "interval": "1m"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "sum(rate(node_cpu_seconds_total{instance=\"$instance\",mode=\"iowait\"}[2m])) / sum(rate(node_cpu_seconds_total{instance=\"$instance\"}[2m])) * 100",
+     "legendFormat": "iowait",
+     "refId": "D",
+     "interval": "1m"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Context switches and interrupts per second",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 19,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "rate(node_context_switches_total{instance=\"$instance\"}[2m])",
+     "legendFormat": "context switches",
+     "refId": "A",
+     "interval": "1m"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "rate(node_intr_total{instance=\"$instance\"}[2m])",
+     "legendFormat": "interrupts",
+     "refId": "B",
+     "interval": "1m"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Load and CPU pressure",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 27,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "node_load1{instance=\"$instance\"}",
+     "legendFormat": "load1",
+     "refId": "A",
+     "interval": "1m"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "rate(node_pressure_cpu_waiting_seconds_total{instance=\"$instance\"}[2m]) * 100",
+     "legendFormat": "PSI cpu some %",
+     "refId": "B",
+     "interval": "1m"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "ZFS throughput (all datasets)",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 27,
+    "w": 12,
+    "h": 8
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "MBs",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "sum(rate(node_zfs_zpool_dataset_nread{instance=\"$instance\"}[2m])) / 1e6",
+     "legendFormat": "read MB/s",
+     "refId": "A",
+     "interval": "1m"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "sum(rate(node_zfs_zpool_dataset_nwritten{instance=\"$instance\"}[2m])) / 1e6",
+     "legendFormat": "write MB/s",
+     "refId": "B",
+     "interval": "1m"
+    }
+   ]
+  },
+  {
+   "type": "timeseries",
+   "title": "The watcher's own CPU time per minute",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vm"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 35,
+    "w": 24,
+    "h": 5
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "spanNulls": false
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "vm"
+     },
+     "expr": "max without (mode) (rdx_preempt_self_cpu_ms)",
+     "legendFormat": "ms CPU / min",
+     "refId": "A",
+     "interval": "1m"
+    }
+   ]
+  }
+ ],
+ "templating": {
+  "list": [
+   {
+    "type": "textbox",
+    "name": "instance",
+    "label": "node_exporter instance",
+    "description": "the Proxmox host's node_exporter target (instance label), e.g. host.example:9100",
+    "query": "host.example:9100",
+    "current": {
+     "text": "host.example:9100",
+     "value": "host.example:9100"
+    },
+    "hide": 0
+   }
+  ]
+ },
+ "editable": false
+}

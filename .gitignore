@@ -1,0 +1,45 @@
+# build output: objects and the binaries of every make target (Makefile, */*.mk)
+*.o
+client/obj/
+gs/.fg/
+client/rdx_clientd
+clip/rdx_clip
+host/rdx_hostd
+gs/rdx_gs_src
+gs/rdx_sink_null
+gs/rdx_gs_probe
+gs/rdx_fg_bench
+gs/rdx_gpu_pressure
+p0a/rdx_gate_gbm
+p0a/rdx_gate_vmm
+p0b/rdx_src
+p0b/rdx_sink_win
+p0b/rdx_sink_kms
+p0b/rdx_lease
+p1/rdx_mirror_src
+p4/rdx_input_tx
+p4/rdx_input_rx
+p4/rdx_input_win
+p5/rdx_audio_tx
+p5/rdx_audio_rx
+usb/rdx_usb_client
+usb/rdx_usb_host
+usb/rdx_usb_probe
+tools/rdx_flash
+tools/rdx_commit_probe
+tests/dummy_mirror_src
+tests/placeholder_demo
+tests/test_audio_follow
+# test binaries (make test); their sources stay tracked
+tests/test_*
+!tests/test_*.c
+!tests/test_*.py
+!tests/test_*.sh
+
+# Python, logs, local tool state
+__pycache__/
+*.pyc
+*.log
+*.csv
+.claude/
+.playwright-mcp/

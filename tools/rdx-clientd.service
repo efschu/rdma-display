@@ -1,0 +1,22 @@
+# rdma-display client daemon (web UI http://127.0.0.1:47991, sessions with rdx-hostd).
+# Installed by desktop/install.sh client; started and stopped by the "RDMA Display Client"
+# tray app (polkit rule 50-rdma-display.rules); install.sh also enables it, so it is up after a reboot. It takes the screen
+# only while a session runs.
+[Unit]
+Description=rdma-display client daemon (rdx-clientd)
+After=network-online.target systemd-logind.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/rdma-display/client/rdx_clientd --repo /opt/rdma-display --config /etc/rdx/client.json
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=10
+# the parts are realtime / DRM master / evdev grabbing processes: root, no sandbox
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

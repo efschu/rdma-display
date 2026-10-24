@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=RDMA Display Host
+GenericName=Stream this computer
+Comment=Share this screen, apps and games with an RDMA Display client
+Exec=/opt/rdma-display/desktop/rdx-tray.py --role host
+Icon=rdx-display
+Terminal=false
+Categories=Network;RemoteAccess;Game;
+Keywords=stream;remote;rdma;moonlight;sunshine;
+StartupNotify=false

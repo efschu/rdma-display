@@ -1,0 +1,21 @@
+{
+  "sink": "window",
+  "link_ip": "10.0.1.2",
+  "rdma_dev": "auto",
+  "mtu": 4096,
+  "hosts": [
+    {"name": "Seat 1 (5090)", "address": "10.0.1.11", "port": 48089},
+    {"name": "Seat 2 (3080)", "address": "10.0.1.12", "port": 48189}
+  ],
+  "active_host": 1,
+  "mode": {"w": 1920, "h": 1080, "hz": 60},
+  "match_host": false,
+  "host_web_port": 48190,
+  "audio": true,
+  "audible": true,
+  "mic": true,
+  "input": true,
+  "pointer": "auto",
+  "usb": [],
+  "audio_runtime_dir": "/run/user/1000"
+}

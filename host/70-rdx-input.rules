@@ -1,0 +1,5 @@
+# rdma-display: the client's keyboard/mouse/pads appear on the host as uinput devices named
+# "rdx: <name>" (p4/rdx_input_rx). gamescope apps run as the desktop user and read input with
+# libinput, so give the user of the active seat access to exactly these devices (logind ACL).
+# Install: cp host/70-rdx-input.rules /etc/udev/rules.d/ && udevadm control --reload
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="rdx: *", TAG+="uaccess"

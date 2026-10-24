@@ -1,0 +1,13 @@
+// rdma-display: the desktop tray app (running as the logged-in user) may start, stop and
+// restart exactly the rdma-display daemons (host, seats, client, window client), without a password. Members of "sudo" only.
+// The session need not be active: on the client the stream VT is in front while it runs.
+polkit.addRule(function (action, subject) {
+    if (action.id != "org.freedesktop.systemd1.manage-units") return polkit.Result.NOT_HANDLED;
+    var unit = action.lookup("unit"), verb = action.lookup("verb");
+    if ((unit == "rdx-hostd.service" || unit == "rdx-clientd.service" || unit == "rdx-clientd-window.service" ||
+         /^rdx-hostd@[0-9]+\.service$/.test(unit)) &&
+        (verb == "start" || verb == "stop" || verb == "restart") &&
+        subject.local && subject.isInGroup("sudo"))
+        return polkit.Result.YES;
+    return polkit.Result.NOT_HANDLED;
+});

@@ -1,0 +1,25 @@
+# rdma-display client daemon, second instance: the stream in a WINDOW of this desktop (config
+# "sink": "window", p0b/rdx_sink_win), e.g. on a computer that is itself a host (e.g. a desktop PC that
+# is also a client of a multiseat host's seats). Own config, web UI http://127.0.0.1:47992 and data ports 19650.. so it never
+# meets this computer's rdx-hostd (47989/47990, 18650..) or a KMS rdx-clientd (47991), and its own
+# menu socket (the in-stream menu and the start placeholder are drawn into the window). No VT switch.
+# `desktop/install.sh client-window` installs and enables it. By hand:
+#   install -m 644 /opt/rdma-display/tools/rdx-clientd-window.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now rdx-clientd-window
+[Unit]
+Description=rdma-display client daemon in a window (rdx-clientd, sink window)
+After=network-online.target systemd-logind.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/rdma-display/client/rdx_clientd --repo /opt/rdma-display --config /etc/rdx/client-window.json --web-port 47992 --data-port-base 19650 --menu-sock /run/rdx/menu-window.sock
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=10
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

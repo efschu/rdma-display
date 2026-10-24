@@ -1,0 +1,28 @@
+# Watches whether the kernel's preemption mode helps the seats and what it costs the host
+# (tools/rdx-preempt-watch.py). Proxmox host, root (debugfs, lxc-attach, cyclictest's SCHED_FIFO).
+# Install: cp tools/rdx-preempt-watch.py /usr/local/sbin/ && cp tools/rdx-preempt-watch*.{service,timer}
+#          /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now rdx-preempt-watch
+#          rdx-preempt-watch-report.timer   (needs rt-tests: apt install rt-tests)
+# Config: /etc/rdx/preempt-watch.json (keys and defaults: the CONF dict in the script; metrics database
+#         "vm_write" / "vm_query" and the "clients" list are off / empty by default)
+[Unit]
+Description=rdma-display: preemption mode watcher (wake-up latency, xruns, underruns, host cost)
+After=network-online.target pve-guests.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/rdx-preempt-watch.py run
+Restart=always
+RestartSec=30
+# no Nice=: the SCHED_OTHER probe would measure the nice level instead of the scheduler
+IOSchedulingClass=idle
+MemoryMax=256M
+# a slice of its own, outside system.slice: when the host's services are limited to one chiplet
+# (AllowedCPUs on system.slice), the probe threads can still follow the seats onto theirs ("wake_cpus")
+Slice=rdx-watch.slice
+RuntimeDirectory=rdx-preempt-watch
+LogsDirectory=rdx-preempt-watch
+
+[Install]
+WantedBy=multi-user.target

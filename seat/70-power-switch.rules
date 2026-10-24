@@ -1,0 +1,18 @@
+# rdma-display (seat/install-seatmgr.sh): replaces systemd's /usr/lib/udev/rules.d/70-power-switch.rules
+# (a file of the same name in /etc/udev/rules.d shadows it). systemd 257 tags every key device
+# "power-switch", and the host's logind then acts on its power / sleep / suspend keys
+# (HandlePowerKey=poweroff ...): a streamed keyboard (uinput/uhid, created in a seat container) or a
+# physical one handed to a seat could switch the Proxmox host off ("Watching system buttons on
+# /dev/input/event20 (rdx: window keyboard ...)" in logind's log). Only the host's own ACPI and platform
+# buttons get the tag. (A rule that takes the tag away later, TAG-=, is not enough: the tag stays in
+# TAGS, and logind's device monitor still matches it.)
+
+ACTION=="remove", GOTO="power_switch_end"
+SUBSYSTEM!="input", GOTO="power_switch_end"
+KERNEL!="event*", GOTO="power_switch_end"
+DEVPATH!="/devices/LNXSYSTM:*", DEVPATH!="/devices/platform/*", GOTO="power_switch_end"
+
+ENV{ID_INPUT_SWITCH}=="1", TAG+="power-switch"
+ENV{ID_INPUT_KEY}=="1", TAG+="power-switch"
+
+LABEL="power_switch_end"

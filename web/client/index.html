@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RDMA Display</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>RDMA Display</h1>
+  <span id="host-pill" class="pill">…</span>
+  <nav>
+    <button id="nav-home" class="tab sel" type="button">Play</button>
+    <button id="nav-settings" class="tab" type="button">Settings</button>
+  </nav>
+</header>
+
+<!-- network link warning (state.link_warning): visible in both views -->
+<div class="banner-wrap"><p id="link-banner" class="banner" role="alert" hidden></p></div>
+
+<main id="view-home">
+  <p id="notice" class="notice" hidden></p>
+
+  <section id="running" class="now" hidden>
+    <div>
+      <p class="now-label" id="now-label">Streaming</p>
+      <h2 id="now-app"></h2>
+      <p id="now-sub" class="muted"></p>
+    </div>
+    <button id="stop" class="big danger" type="button">Stop</button>
+  </section>
+
+  <!-- the host's little free graphics memory at this stream's start, with the apps that hold it -->
+  <p id="vram-warn" class="notice" hidden></p>
+  <!-- every app still running on the other computer (in its background): Resume / Quit each -->
+  <div id="paused-list"></div>
+
+  <section>
+    <h2 id="apps-host" class="hosthead" hidden></h2>
+    <div id="apps-cardbar"></div>
+    <div id="apps" class="tiles"></div>
+    <p id="apps-note" class="muted center"></p>
+  </section>
+  <!-- further hosts / seats (config "hosts"): one group of tiles each -->
+  <div id="other-hosts"></div>
+
+  <section class="card" id="link-card" hidden>
+    <h2>Network link <span id="link-lvl" class="lvl"></span></h2>
+    <div id="link-body"></div>
+  </section>
+
+  <p class="keys">
+    Back to this computer: <kbd>Left Ctrl</kbd> + <kbd>Left Alt</kbd> + <kbd>Esc</kbd>
+    <span class="sep">·</span>
+    Menu while streaming: <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>M</kbd>
+  </p>
+</main>
+
+<main id="view-settings" hidden>
+  <form id="settings" autocomplete="off">
+    <section class="card">
+      <h2>Picture</h2>
+      <label class="field">Resolution and refresh rate
+        <select name="mode"></select>
+      </label>
+      <label class="check small"><input type="checkbox" id="all-modes"> Show all modes</label>
+      <label class="switch"><input type="checkbox" name="tearing"><span></span>
+        <span class="lbl">Tearing allowed – lowest latency<br>
+        <small class="muted">No waiting for the screen's refresh: each frame shows the moment it arrives. Moving pictures may show a horizontal tear line.</small></span></label>
+      <label class="switch"><input type="checkbox" name="match_host"><span></span>
+        <span class="lbl">Match the other computer's screen <i class="rec">recommended for whole-screen apps</i><br>
+        <small class="muted">For “Desktop” this screen runs at exactly the other screen's refresh rate (e.g. 144 Hz), at the resolution chosen above. Games keep the rate chosen above.</small></span></label>
+      <div class="choice">
+        <label class="opt"><input type="radio" name="pacing" value="latency">
+          <span><b>Lowest latency</b> <i class="rec">recommended</i><br><small>Every new frame is shown at once.</small></span></label>
+        <label class="opt"><input type="radio" name="pacing" value="smooth">
+          <span><b>Smooth motion</b><br><small>Frames at an even rhythm that fits this screen, a little more delay.</small></span></label>
+      </div>
+      <label class="switch"><input type="checkbox" name="cursor"><span></span> Show the mouse pointer</label>
+      <label class="switch"><input type="checkbox" name="vrr"><span></span>
+        <span class="lbl">FreeSync / variable refresh where the screen can <i class="rec">recommended</i><br>
+        <small class="muted">The screen refreshes when a frame arrives, at the app's own pace, without stutter or tearing. On a window: when it is full screen on a monitor that runs with a variable refresh.</small></span></label>
+      <div class="choice" id="game-monitor" hidden>
+        <label class="opt"><input type="radio" name="game_monitor" value="auto">
+          <span><b>Game monitor: automatic</b> <i class="rec">recommended</i><br><small>With two or more monitors on X11 the game takes its monitor directly (no compositor in between, FreeSync); the desktop stays on the others. Otherwise a full-screen window.</small></span></label>
+        <label class="opt"><input type="radio" name="game_monitor" value="lease">
+          <span><b>Game monitor directly (lease)</b><br><small>The monitor is taken from the desktop for the stream and given back when it ends.</small></span></label>
+        <label class="opt"><input type="radio" name="game_monitor" value="window">
+          <span><b>Full-screen window</b><br><small>The stream in a window of the desktop.</small></span></label>
+      </div>
+      <label class="field" id="desktop-hotkey" hidden>Keyboard and mouse to the desktop and back
+        <input type="text" name="desktop_hotkey" placeholder="ctrl+alt+h" spellcheck="false">
+        <small class="muted">Modifiers and one key, e.g. ctrl+alt+h. Ctrl+Alt+Shift+Z works too.</small></label>
+      <label class="switch" id="window-fullscreen" hidden><input type="checkbox" name="window_fullscreen"><span></span>
+        <span class="lbl">Full screen when the resolution is the monitor's own<br>
+        <small class="muted">The window opens full screen on its monitor (the one it was on last time), pixel for pixel. F11 switches.</small></span></label>
+      <div class="choice" id="pointer-choice" hidden>
+        <label class="opt"><input type="radio" name="pointer" value="auto">
+          <span><b>Mouse in the window: automatic</b> <i class="rec">recommended</i><br><small>The pointer goes where yours is; when a game hides and locks it, a click into the window captures the mouse (Ctrl+Alt+Shift+Z lets it go).</small></span></label>
+        <label class="opt"><input type="radio" name="pointer" value="absolute">
+          <span><b>Mouse in the window: always the pointer</b><br><small>For desktop apps: never captured.</small></span></label>
+        <label class="opt"><input type="radio" name="pointer" value="relative">
+          <span><b>Mouse in the window: always captured</b><br><small>For games: a click into the window captures the mouse, Ctrl+Alt+Shift+Z lets it go.</small></span></label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Sound</h2>
+      <label class="switch"><input type="checkbox" name="sound"><span></span> Play the sound here</label>
+      <label class="switch"><input type="checkbox" name="mic"><span></span>
+        <span class="lbl">Send the microphone<br>
+        <small class="muted">The other computer gets it as “RDMA Display Mic”. This microphone opens only while an app there records; the mic-mute key and the stream menu mute it.</small></span></label>
+      <label class="field">Microphone
+        <select name="mic_source"></select>
+      </label>
+    </section>
+
+    <section class="card" id="clip-card">
+      <h2>Clipboard</h2>
+      <label class="switch"><input type="checkbox" name="clipboard"><span></span>
+        <span class="lbl">Share the clipboard with the app<br>
+        <small class="muted">Text copied in the stream can be pasted on this desktop, and the other way round (up to 1 MiB). What you copied before the stream starts is there in the app. The stream menu (Ctrl+Alt+Shift+M) switches it too.</small></span></label>
+      <label class="switch"><input type="checkbox" name="clipboard_primary"><span></span>
+        <span class="lbl">Also the selected text<br>
+        <small class="muted">Text selected with the mouse, pasted with the middle button, goes along as well.</small></span></label>
+      <p class="muted small" id="clip-state"></p>
+    </section>
+
+    <section class="card">
+      <h2>Keyboard and mouse</h2>
+      <label class="switch"><input type="checkbox" name="input"><span></span> Control the other computer with this keyboard and mouse</label>
+      <div id="inputs" class="list"></div>
+    </section>
+
+    <section class="card">
+      <h2>USB devices</h2>
+      <p class="muted small">Switched-on devices move to the other computer while you stream and come back afterwards.</p>
+      <div id="usb" class="list"></div>
+    </section>
+
+    <details class="card" id="advanced">
+      <summary>Advanced</summary>
+      <label class="field">Host address <input name="host" placeholder="10.0.0.2"></label>
+      <label class="field">Host settings page port <input name="host_web_port" type="number" min="1" max="65535"></label>
+      <label class="field">Frame rate limit
+        <select name="fps">
+          <option value="0">none</option><option value="60">60</option><option value="120">120</option>
+          <option value="144">144</option><option value="240">240</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" name="audio"> Receive sound (off: no sound at all)</label>
+      <label class="field">Host graphics priority
+        <select name="gpu_prio"><option>high</option><option>medium</option><option>low</option></select>
+      </label>
+      <div id="usb-adv" class="list"></div>
+      <label class="field">Network device <input name="rdma_dev"></label>
+      <label class="field">This computer's link address <input name="link_ip"></label>
+      <label class="field">MTU <input name="mtu" type="number"></label>
+      <label class="field">Display card <input name="card"></label>
+      <label class="field">Stream console (VT) <input name="sink_vt" type="number"></label>
+      <label class="field">Desktop console (VT) <input name="desk_vt" type="number"></label>
+      <div class="row">
+        <button id="refresh" class="ghost" type="button">Re-detect screens and devices</button>
+        <button id="restart-host" class="ghost" type="button">Restart the host program</button>
+      </div>
+      <table id="procs" class="procs" hidden>
+        <thead><tr><th>part</th><th>pid</th><th>CPU</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <pre id="log" hidden></pre>
+    </details>
+  </form>
+  <p id="saved" class="toast" hidden>Saved</p>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

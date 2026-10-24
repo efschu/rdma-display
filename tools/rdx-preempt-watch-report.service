@@ -1,0 +1,8 @@
+[Unit]
+Description=rdma-display: daily comparison of the preemption modes (tools/rdx-preempt-watch.py report)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/rdx-preempt-watch.py report
+Nice=10
+IOSchedulingClass=idle

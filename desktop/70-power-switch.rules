@@ -1,0 +1,25 @@
+# rdma-display (desktop/install.sh host): systemd's 70-power-switch.rules (same name in
+# /etc/udev/rules.d shadows /usr/lib/udev/rules.d), unchanged for this computer's own devices, but
+# the input devices of a stream are no power switches here: systemd tags every key device
+# "power-switch", and logind acts on its power / sleep / suspend keys (HandlePowerKey=poweroff ...),
+# so a key pressed at a client would switch this host off or suspend it (logind watched
+# "rdx: mini keyboard", "rdx: local window keyboard" ...). Left out:
+#  - phys "rdx:*": rdx_usb_host's uhid mirrors ("rdx:" / "rdx:private:"), rdx_input_rx --private
+#    and a local window's keyboard ("rdx:private");
+#  - name "rdx: *": rdx_input_rx's mirrors of a mirrored desktop (no phys);
+#  - every device behind vhci_hcd: USB/IP devices are a client's (rdx_usb_host).
+# (Removing the tag later with TAG-= does not work: it stays in TAGS, which logind matches.)
+# rdx_input_tx / rdx_uinput_create_phys also leave the system keys out of every mirror
+# (common/rdx_input.h rdx_input_system_key); this rule covers what comes as raw HID.
+
+ACTION=="remove", GOTO="power_switch_end"
+SUBSYSTEM!="input", GOTO="power_switch_end"
+KERNEL!="event*", GOTO="power_switch_end"
+ATTRS{phys}=="rdx:*", GOTO="power_switch_end"
+ATTRS{name}=="rdx: *", GOTO="power_switch_end"
+KERNELS=="vhci_hcd.*", GOTO="power_switch_end"
+
+ENV{ID_INPUT_SWITCH}=="1", TAG+="power-switch"
+ENV{ID_INPUT_KEY}=="1", TAG+="power-switch"
+
+LABEL="power_switch_end"
