@@ -1,12 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="256" height="256" role="img" aria-label="rdma-display">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" width="256" height="256" role="img" aria-label="rdma-display">
 <title>rdma-display</title>
-<defs><linearGradient id="lane" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="82" y2="0"><stop offset="0" stop-color="#38BDF8" stop-opacity="0"/><stop offset="0.45" stop-color="#38BDF8"/><stop offset="1" stop-color="#818CF8"/></linearGradient></defs>
-<rect width="96" height="96" rx="20" fill="#0B1220"/>
-<g transform="translate(0 0) scale(1.0)">
-<path d="M26 27 V25 Q26 18 33 18 H85 Q92 18 92 25 V60 Q92 67 85 67 H33 Q26 67 26 60 V53" fill="none" stroke="#F1F5F9" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M59 67 V79 M48 79 H70" fill="none" stroke="#F1F5F9" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
-<line x1="6" y1="33" x2="72" y2="33" stroke="url(#lane)" stroke-width="4.2" stroke-linecap="round"/>
-<line x1="0" y1="40" x2="82" y2="40" stroke="url(#lane)" stroke-width="4.2" stroke-linecap="round"/>
-<line x1="12" y1="47" x2="64" y2="47" stroke="url(#lane)" stroke-width="4.2" stroke-linecap="round"/>
+<defs><linearGradient id="lane" gradientUnits="userSpaceOnUse" x1="14" y1="0" x2="150" y2="0"><stop offset="0" stop-color="#38BDF8"/><stop offset="1" stop-color="#818CF8"/></linearGradient></defs>
+<rect width="160" height="160" rx="32" fill="#0B1220"/>
+<g transform="translate(0 34) scale(1.0)">
+<rect x="6" y="26" width="30" height="30" rx="5" fill="none" stroke="#F1F5F9" stroke-width="5"/>
+<path d="M14 18.5 V22 M14 60 V63.5 M21 18.5 V22 M21 60 V63.5 M28 18.5 V22 M28 60 V63.5" fill="none" stroke="#F1F5F9" stroke-width="4" stroke-linecap="round"/>
+<rect x="14" y="34" width="14" height="14" rx="2.5" fill="url(#lane)"/>
+<rect x="101" y="25" width="48" height="30" rx="3" fill="url(#lane)" opacity="0.9"/>
+<path d="M92 28 V25 Q92 18 99 18 H149 Q156 18 156 25 V55 Q156 62 149 62 H99 Q92 62 92 55 V54 M124 62 V73 M113 73 H135" fill="none" stroke="#F1F5F9" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+<line x1="43" y1="35" x2="80" y2="35" stroke="url(#lane)" stroke-width="4.2" stroke-linecap="round" stroke-dasharray="7 6"/>
+<line x1="88" y1="35" x2="102" y2="35" stroke="url(#lane)" stroke-width="4.2" stroke-linecap="round"/>
+<line x1="43" y1="41" x2="80" y2="41" stroke="url(#lane)" stroke-width="4.2" stroke-linecap="round" stroke-dasharray="7 6"/>
+<line x1="88" y1="41" x2="102" y2="41" stroke="url(#lane)" stroke-width="4.2" stroke-linecap="round"/>
+<line x1="43" y1="47" x2="80" y2="47" stroke="url(#lane)" stroke-width="4.2" stroke-linecap="round" stroke-dasharray="7 6"/>
+<line x1="88" y1="47" x2="102" y2="47" stroke="url(#lane)" stroke-width="4.2" stroke-linecap="round"/>
 </g>
 </svg>
